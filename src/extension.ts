@@ -27,20 +27,19 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
+	type AgentMessage,
 	type CompactionSummaryMessage,
 	estimateTokens,
-} from "@oh-my-pi/pi-agent-core/compaction";
-import type { Message, Model } from "@oh-my-pi/pi-ai";
+} from "@earendil-works/pi-agent-core";
+import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import type {
 	ContextEvent,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 	SessionBeforeCompactEvent,
-} from "@oh-my-pi/pi-coding-agent";
-import { settings } from "@oh-my-pi/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 // ============================================================================
 // Types
@@ -76,7 +75,7 @@ interface LooseSettings {
 
 let activeAgentDir = "";
 let activeCwd = "";
-let yamlConfig: Record<string, any> = {};
+let yamlConfig: Record<string, unknown> = {};
 let lastLoadedTime = 0;
 
 function getAgentDirFallback(): string {
@@ -84,42 +83,183 @@ function getAgentDirFallback(): string {
 		return process.env.PI_CODING_AGENT_DIR;
 	}
 	const home = process.env.HOME || process.env.USERPROFILE || "";
+	// Check pi-agent path first, then OMP path
+	const piAgentDir = path.join(home, ".pi", "agent");
+	if (fs.existsSync(piAgentDir)) {
+		return piAgentDir;
+	}
 	return path.join(home, ".omp", "agent");
 }
 
-function loadYamlSettings(agentDir: string, cwd: string): Record<string, any> {
-	const config: Record<string, any> = {};
+/**
+ * Minimal YAML subset parser — handles flat keys, nested maps, and simple lists.
+ * Supports the OMP/pi config.yml format:
+ *   key: value
+ *   parent:
+ *     child: value
+ *   list:
+ *     - item1
+ *     - item2
+ * Does NOT support: multiline strings, anchors, aliases, flow style, tags.
+ * Works in both Bun and Node.js runtimes (no Bun.YAML dependency).
+ */
+function parseSimpleYAML(content: string): Record<string, unknown> {
+	return _parseYAMLInternal(content.split("\n"));
+}
 
-	// 1. Read global config
+function _parseYAMLInternal(lines: string[]): Record<string, unknown> {
+	const root: Record<string, unknown> = {};
+
+	type Frame = {
+		obj: Record<string, unknown> | unknown[];
+		indent: number;
+	};
+
+	// Root frame sits at indent -2 so any indent >= 0 stays inside it
+	const stack: Frame[] = [{ obj: root, indent: -2 }];
+
+	for (let i = 0; i < lines.length; i++) {
+		const rawLine = lines[i];
+		const commentIdx = rawLine.indexOf("#");
+		const line = commentIdx !== -1 ? rawLine.slice(0, commentIdx) : rawLine;
+		if (line.trim() === "") continue;
+
+		const indent = line.search(/\S/);
+		const trimmed = line.trim();
+
+		// Pop stack to find the correct parent: pop frames at the same or deeper indent
+		while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
+			stack.pop();
+		}
+
+		const parentFrame = stack[stack.length - 1];
+		const parent = parentFrame.obj;
+
+		// List item at this level
+		if (trimmed.startsWith("- ")) {
+			if (!Array.isArray(parent)) continue;
+			const val = trimmed.slice(2).trim();
+			parent.push(parseYAMLValue(val));
+			continue;
+		}
+
+		// Key: value pair
+		const colonIdx = trimmed.indexOf(":");
+		if (colonIdx === -1) continue;
+		const key = trimmed.slice(0, colonIdx).trim();
+		const rawVal = trimmed.slice(colonIdx + 1).trim();
+
+		if (rawVal === "") {
+			// Nested structure follows — peek ahead to determine if it's a map or list
+			let nextIndent = -1;
+			let nextIsList = false;
+			for (let j = i + 1; j < lines.length; j++) {
+				const nl = lines[j].replace(/#.*$/, "");
+				if (nl.trim() === "") continue;
+				nextIndent = nl.search(/\S/);
+				nextIsList = nl.trim().startsWith("- ");
+				break;
+			}
+
+			if (nextIndent > indent) {
+				if (nextIsList) {
+					const arr: unknown[] = [];
+					if (Array.isArray(parent)) continue;
+					parent[key] = arr;
+					// Frame indent = current indent (children are deeper)
+					stack.push({ obj: arr, indent });
+				} else {
+					const obj: Record<string, unknown> = {};
+					if (Array.isArray(parent)) continue;
+					parent[key] = obj;
+					// Frame indent = current indent (children are deeper)
+					stack.push({ obj, indent });
+				}
+			} else {
+				// Nothing follows at deeper indent — null value
+				if (!Array.isArray(parent)) {
+					parent[key] = null;
+				}
+			}
+		} else {
+			const val = parseYAMLValue(rawVal);
+			if (Array.isArray(parent)) continue;
+			parent[key] = val;
+		}
+	}
+
+	return root;
+}
+
+function parseYAMLValue(raw: string): unknown {
+	const trimmed = raw.trim();
+	if (trimmed === "true") return true;
+	if (trimmed === "false") return false;
+	if (trimmed === "null" || trimmed === "~") return null;
+	if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10);
+	if (/^-?\d+\.\d+$/.test(trimmed)) return parseFloat(trimmed);
+	if (
+		(trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+		(trimmed.startsWith("'") && trimmed.endsWith("'"))
+	) {
+		return trimmed.slice(1, -1);
+	}
+	return trimmed;
+}
+
+function loadYamlSettings(
+	agentDir: string,
+	cwd: string,
+): Record<string, unknown> {
+	const config: Record<string, unknown> = {};
+
+	// 1. Read global config (config.yml or settings.json)
 	const globalConfigPath = path.join(agentDir, "config.yml");
+	const globalSettingsPath = path.join(agentDir, "settings.json");
+
 	if (fs.existsSync(globalConfigPath)) {
 		try {
 			const content = fs.readFileSync(globalConfigPath, "utf8");
-			const parsed = Bun.YAML.parse(content);
+			const parsed = parseSimpleYAML(content);
 			if (parsed && typeof parsed === "object") {
 				Object.assign(config, parsed);
 			}
-		} catch (e) {
+		} catch (_e) {
+			// ignore
+		}
+	} else if (fs.existsSync(globalSettingsPath)) {
+		try {
+			const content = fs.readFileSync(globalSettingsPath, "utf8");
+			const parsed = JSON.parse(content) as Record<string, unknown>;
+			if (parsed && typeof parsed === "object") {
+				Object.assign(config, parsed);
+			}
+		} catch (_e) {
 			// ignore
 		}
 	}
 
-	// 2. Read project config (check cwd/.omp/config.yml or cwd/config.yml or cwd/.claude/config.yml)
+	// 2. Read project config (check .omp, .pi, and .claude config locations)
 	const projectPaths = [
 		path.join(cwd, ".omp", "config.yml"),
+		path.join(cwd, ".pi", "config.yml"),
 		path.join(cwd, "config.yml"),
 		path.join(cwd, ".claude", "config.yml"),
+		path.join(cwd, ".pi", "settings.json"),
+		path.join(cwd, "settings.json"),
 	];
 	for (const p of projectPaths) {
 		if (fs.existsSync(p)) {
 			try {
 				const content = fs.readFileSync(p, "utf8");
-				const parsed = Bun.YAML.parse(content);
+				const parsed = p.endsWith(".json")
+					? (JSON.parse(content) as Record<string, unknown>)
+					: parseSimpleYAML(content);
 				if (parsed && typeof parsed === "object") {
 					Object.assign(config, parsed);
 				}
 				break; // Only load the first matching project config
-			} catch (e) {
+			} catch (_e) {
 				// ignore
 			}
 		}
@@ -128,15 +268,19 @@ function loadYamlSettings(agentDir: string, cwd: string): Record<string, any> {
 	return config;
 }
 
-function getFromConfig(config: Record<string, any>, key: string): any {
+function getFromConfig(config: Record<string, unknown>, key: string): unknown {
 	if (key in config) {
 		return config[key];
 	}
 	const parts = key.split(".");
-	let val: any = config;
+	let val: unknown = config;
 	for (const part of parts) {
-		if (val && typeof val === "object" && part in val) {
-			val = val[part];
+		if (
+			val &&
+			typeof val === "object" &&
+			part in (val as Record<string, unknown>)
+		) {
+			val = (val as Record<string, unknown>)[part];
 		} else {
 			return undefined;
 		}
@@ -171,17 +315,7 @@ const looseSettings: LooseSettings = {
 			return val;
 		}
 
-		// 3. Fallback to OMP-initialized settings instance (if it doesn't throw)
-		try {
-			const hostVal = settings.get(key as any);
-			if (hostVal !== undefined) {
-				return hostVal;
-			}
-		} catch (e) {
-			// ignore
-		}
-
-		// 4. Default fallbacks
+		// 3. Default fallbacks
 		switch (key) {
 			case "relace.enabled":
 				return true;
@@ -193,6 +327,8 @@ const looseSettings: LooseSettings = {
 				return 128000;
 			case "relace.thresholdtype":
 				return "integer";
+			case "relace.idleCompactionThresholds":
+				return {};
 			case "compaction.idleTimeoutSeconds":
 				return 300;
 			case "compaction.idleThresholdTokens":
@@ -242,17 +378,29 @@ function isPluginEnabled(): boolean {
 	return typeof val === "boolean" ? val : true;
 }
 
+function isOmp(): boolean {
+	const agentDir = activeAgentDir || getAgentDirFallback();
+	return agentDir.includes(".omp");
+}
+
 /**
  * Returns true if the active compaction strategy is one that Relace can honor.
  * Relace does in-place summarization (context-full) and can feed a handoff doc.
  * It cannot do snapcompact (vision bitmap), shake (surgical drop), or off.
  */
 function isRelaceCompatibleStrategy(): boolean {
+	if (!isOmp()) {
+		// In regular pi-agent, we always run context-full compaction
+		return true;
+	}
 	const strategy = looseSettings.get("compaction.strategy");
 	return strategy === "context-full" || strategy === "handoff";
 }
 
 function getCompactionStrategy(): string {
+	if (!isOmp()) {
+		return "context-full";
+	}
 	const val = looseSettings.get("compaction.strategy");
 	return typeof val === "string" ? val : "snapcompact";
 }
@@ -267,7 +415,7 @@ function getEndpoint(): string {
 	return typeof val === "string" ? val : RELACE_ENDPOINT_DEFAULT;
 }
 
-function getTargetTokens(model?: Model): number {
+function getTargetTokens(model?: Model<Api>): number {
 	const val = looseSettings.get("relace.targetTokens");
 	const target =
 		typeof val === "number" && Number.isFinite(val) && val > 0 ? val : 128_000;
@@ -280,6 +428,76 @@ function getTargetTokens(model?: Model): number {
 		return Math.round((model.contextWindow * Math.min(target, 100)) / 100);
 	}
 	return Math.round(target);
+}
+
+function matchGlob(str: string, pattern: string): boolean {
+	const escapeRegex = (s: string) =>
+		s.replace(/([.*+?^=!:${}()|[\]/\\])/g, "\\$1");
+	const regexStr = `^${pattern.split("*").map(escapeRegex).join(".*")}$`;
+	return new RegExp(regexStr, "i").test(str);
+}
+
+function matchesModelPattern(
+	modelId: string,
+	provider: string,
+	pattern: string,
+): boolean {
+	const fullId = `${provider}/${modelId}`;
+	if (pattern.includes("/")) {
+		return matchGlob(fullId, pattern);
+	}
+	return matchGlob(modelId, pattern) || matchGlob(provider, pattern);
+}
+
+function getIdleTimeoutSeconds(model: Model<Api> | undefined): number {
+	const defaultFallback =
+		(looseSettings.get("compaction.idleTimeoutSeconds") as number) ?? 300;
+	if (!model) {
+		return defaultFallback;
+	}
+
+	const modelId = model.id;
+	const provider = model.provider || "";
+
+	// 1. Check custom overrides from settings
+	const customThresholds =
+		(looseSettings.get("relace.idleCompactionThresholds") as Record<
+			string,
+			number
+		>) || {};
+
+	for (const pattern of Object.keys(customThresholds)) {
+		if (matchesModelPattern(modelId, provider, pattern)) {
+			const seconds = customThresholds[pattern];
+			if (typeof seconds === "number" && seconds > 0) {
+				return seconds;
+			}
+		}
+	}
+
+	// 2. If running under pi-agent, check default family rules
+	const isPi = activeAgentDir.includes(".pi");
+	if (isPi) {
+		if (
+			matchesModelPattern(modelId, provider, "openai*/gpt*") ||
+			matchesModelPattern(modelId, provider, "openai-codex/gpt*") ||
+			modelId.toLowerCase().startsWith("gpt") ||
+			provider.toLowerCase() === "openai"
+		) {
+			return 1800; // 30 minutes
+		}
+		if (
+			matchesModelPattern(modelId, provider, "claude*/*") ||
+			matchesModelPattern(modelId, provider, "anthropic/*") ||
+			modelId.toLowerCase().includes("claude") ||
+			provider.toLowerCase() === "anthropic"
+		) {
+			return 300; // 5 minutes
+		}
+	}
+
+	// 3. Fall back to OMP default
+	return defaultFallback;
 }
 
 // ============================================================================
@@ -298,13 +516,27 @@ function convertToLlmFormat(messages: AgentMessage[]): RelaceMessage[] {
 	const result: RelaceMessage[] = [];
 	for (const msg of messages) {
 		const role = msg.role;
-		if (role === "user" || role === "assistant" || role === "developer") {
-			const content = msg.content;
-			if (typeof content === "string" || Array.isArray(content)) {
-				result.push({ role, content });
+		if (
+			role === "user" ||
+			role === "assistant" ||
+			(role as string) === "developer"
+		) {
+			if ("content" in msg) {
+				const content = msg.content;
+				if (typeof content === "string" || Array.isArray(content)) {
+					result.push({
+						role: role as "user" | "assistant" | "developer",
+						content,
+					});
+				}
 			}
 		} else if (role === "toolResult") {
-			if (msg && typeof msg === "object" && "toolCallId" in msg) {
+			if (
+				msg &&
+				typeof msg === "object" &&
+				"toolCallId" in msg &&
+				"content" in msg
+			) {
 				const content = msg.content;
 				if (typeof content === "string" || Array.isArray(content)) {
 					result.push({
@@ -379,7 +611,7 @@ async function callRelaceCompact(
 
 async function performCompaction(
 	messages: AgentMessage[],
-	model: Model | undefined,
+	model: Model<Api> | undefined,
 	ctx: ExtensionContext,
 ): Promise<SessionState> {
 	const sessionId = ctx.sessionManager.getSessionId();
@@ -458,6 +690,7 @@ async function onSessionBeforeCompact(
 	event: SessionBeforeCompactEvent,
 	ctx: ExtensionContext,
 ) {
+	updateActivePaths(ctx);
 	if (!isPluginEnabled()) {
 		return;
 	}
@@ -528,6 +761,7 @@ async function onContext(
 	event: ContextEvent,
 	ctx: ExtensionContext,
 ): Promise<{ messages: AgentMessage[] } | undefined> {
+	updateActivePaths(ctx);
 	if (!isPluginEnabled()) {
 		return undefined;
 	}
@@ -569,8 +803,7 @@ async function onContext(
 
 	// Honor the idle gate for "idle"-reason triggers — don't fire mid-session.
 	if (reason === "idle") {
-		const idleDelayMs =
-			(get<number>("compaction.idleTimeoutSeconds") ?? 300) * 1000;
+		const idleDelayMs = getIdleTimeoutSeconds(ctx.model) * 1000;
 		if (Date.now() - state.lastTurnEndTime <= idleDelayMs) {
 			return undefined;
 		}
@@ -598,32 +831,52 @@ function onTurnEnd(ctx: ExtensionContext): void {
 // Commands
 // ============================================================================
 
+function outputCommandMessage(
+	ctx: ExtensionCommandContext,
+	text: string,
+	level: "info" | "warning" | "error",
+): void {
+	ctx.ui.notify(text, level);
+	if (ctx.mode !== "tui") {
+		if (level === "error") {
+			console.error(text);
+		} else {
+			console.log(text);
+		}
+	}
+}
+
 function handleStatusCommand(ctx: ExtensionCommandContext): void {
+	updateActivePaths(ctx);
 	const sessionId = ctx.sessionManager.getSessionId();
 	const state = getSessionState(sessionId);
 	const currentTokens = ctx.getContextUsage()?.tokens ?? 0;
 	const isEnabled = isPluginEnabled();
 	const strategy = getCompactionStrategy();
 	const strategyHonored = isRelaceCompatibleStrategy();
+	const idleTimeout = getIdleTimeoutSeconds(ctx.model);
 
-	console.log(`Relace Compact Status — Session ${sessionId}:`);
-	console.log(`  Plugin enabled: ${isEnabled}`);
-	console.log(
+	const report = [
+		`Relace Compact Status — Session ${sessionId}:`,
+		`  Plugin enabled: ${isEnabled}`,
 		`  Strategy:       ${strategy}${strategyHonored ? " (honored)" : " (ignored — Relace only handles context-full and handoff)"}`,
-	);
-	console.log(
+		`  Idle timeout:   ${idleTimeout} seconds (${(idleTimeout / 60).toFixed(1)} minutes)`,
 		`  Cached:         ${state.compactedMessages ? `Yes (${state.compactedMessages.length} messages, ${state.compactionCount} compactions)` : "No"}`,
-	);
-	console.log(`  Current tokens: ${currentTokens.toLocaleString()}`);
-	console.log(`  Target tokens:  ${getTargetTokens().toLocaleString()}`);
-	console.log(`  Endpoint:       ${getEndpoint()}`);
+		`  Current tokens: ${currentTokens.toLocaleString()}`,
+		`  Target tokens:  ${getTargetTokens().toLocaleString()}`,
+		`  Endpoint:       ${getEndpoint()}`,
+	].join("\n");
+
+	outputCommandMessage(ctx, report, "info");
 }
 
 function handleResetCommand(ctx: ExtensionCommandContext): void {
 	const sessionId = ctx.sessionManager.getSessionId();
 	sessionStates.delete(sessionId);
-	console.log(
+	outputCommandMessage(
+		ctx,
 		`Relace compact cache cleared for session ${sessionId}. Next turn will re-compact if thresholds are met.`,
+		"info",
 	);
 }
 
@@ -635,22 +888,31 @@ function handleResetCommand(ctx: ExtensionCommandContext): void {
 async function handleCompactCommand(
 	ctx: ExtensionCommandContext,
 ): Promise<void> {
+	updateActivePaths(ctx);
 	const sessionId = ctx.sessionManager.getSessionId();
 	const apiKey = getApiKey();
 
 	if (!isPluginEnabled()) {
-		console.log("Relace Compact is disabled. Enable it with relace.enabled.");
+		outputCommandMessage(
+			ctx,
+			"Relace Compact is disabled. Enable it with relace.enabled.",
+			"warning",
+		);
 		return;
 	}
 	if (!isRelaceCompatibleStrategy()) {
-		console.log(
+		outputCommandMessage(
+			ctx,
 			`Current compaction strategy "${getCompactionStrategy()}" is not compatible with Relace. Set compaction.strategy to "context-full" or "handoff".`,
+			"warning",
 		);
 		return;
 	}
 	if (!apiKey) {
-		console.log(
+		outputCommandMessage(
+			ctx,
 			"Relace API key not configured. Set relace.apiKey in settings or RELACE_API_KEY env var.",
+			"warning",
 		);
 		return;
 	}
@@ -658,14 +920,25 @@ async function handleCompactCommand(
 	// Clear cache so the next context event doesn't skip
 	sessionStates.delete(sessionId);
 
-	console.log("Forcing Relace compaction via native /compact...");
+	outputCommandMessage(
+		ctx,
+		"Forcing Relace compaction via native /compact...",
+		"info",
+	);
 	try {
-		await ctx.compact("Compact via Relace Compact");
-		console.log("Relace compaction triggered successfully.");
+		ctx.compact({
+			customInstructions: "Compact via Relace Compact",
+		});
+		outputCommandMessage(
+			ctx,
+			"Relace compaction triggered successfully.",
+			"info",
+		);
 	} catch (err) {
-		console.error(
-			"[relace-compact] forced compaction failed:",
-			err instanceof Error ? err.message : err,
+		outputCommandMessage(
+			ctx,
+			`Forced compaction failed: ${err instanceof Error ? err.message : String(err)}`,
+			"error",
 		);
 	}
 }
@@ -674,16 +947,50 @@ async function handleCompactCommand(
 // Extension Registration
 // ============================================================================
 
+function updateActivePaths(ctx: ExtensionContext) {
+	activeCwd = ctx.cwd;
+	try {
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (sessionFile) {
+			activeAgentDir = path.resolve(sessionFile, "../..");
+		}
+	} catch (_e) {
+		// ignore
+	}
+}
+
 export default function relaceCompactExtension(pi: ExtensionAPI): void {
-	if (pi.pi?.Settings?.instance) {
+	const untypedPi = pi as unknown as Record<string, unknown>;
+	if (untypedPi.pi) {
+		const piSdk = untypedPi.pi as Record<string, unknown>;
+		const SettingsClass = piSdk.Settings as Record<string, unknown>;
+		if (SettingsClass?.instance) {
+			try {
+				const settingsInstance = SettingsClass.instance as Record<
+					string,
+					unknown
+				>;
+				if (typeof settingsInstance.getAgentDir === "function") {
+					activeAgentDir = (settingsInstance.getAgentDir as () => string)();
+				}
+				if (typeof settingsInstance.getCwd === "function") {
+					activeCwd = (settingsInstance.getCwd as () => string)();
+				}
+			} catch (_e) {
+				// ignore
+			}
+		}
+	}
+
+	if (typeof untypedPi.setLabel === "function") {
 		try {
-			activeAgentDir = pi.pi.Settings.instance.getAgentDir();
-			activeCwd = pi.pi.Settings.instance.getCwd();
-		} catch (e) {
+			if (untypedPi.setLabel.length === 1) {
+				(untypedPi.setLabel as (label: string) => void)("Relace Compact");
+			}
+		} catch (_e) {
 			// ignore
 		}
 	}
-	pi.setLabel("Relace Compact");
 
 	// Core event: intercept outbound LLM context to inject compacted messages.
 	pi.on("context", onContext);
@@ -695,7 +1002,7 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 	pi.on("session_before_compact", onSessionBeforeCompact);
 
 	// Slash commands for introspection and forced compaction.
-	pi.registerCommand("relace", {
+	pi.registerCommand("compact-relace", {
 		description: "Inspect or manage Relace Compact state",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
 			try {
@@ -704,8 +1011,9 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 				else if (sub === "reset") handleResetCommand(ctx);
 				else if (sub === "compact") await handleCompactCommand(ctx);
 				else {
-					console.log(
-						"Usage: /relace status | /relace reset | /relace compact",
+					ctx.ui.notify(
+						"Usage: /compact-relace status | /compact-relace reset | /compact-relace compact",
+						"info",
 					);
 				}
 			} catch (err) {
