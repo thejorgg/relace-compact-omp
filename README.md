@@ -19,18 +19,19 @@ The extension never implements a second summarizer. It is a transport adapter fr
 
 ## Install
 
-From npm or a local checkout:
+~~From npm or a local checkout: ~~
+
+~~pi install npm:relace-compact-omp ~~
+~~omp plugin install npm:relace-compact-omp ~~
+
+For now, git clone:
 
 ```bash
-pi install npm:relace-compact-omp
-# or
-omp plugin install npm:relace-compact-omp
-```
-
-For local development:
-
-```bash
+git clone https://github.com/thejorgg/relace-compact-omp relace-compact-omp
+cd relace-compact-omp
 omp plugin link .
+# or
+pi install .
 ```
 
 ## Configure OMP (context-full only) 🧩
