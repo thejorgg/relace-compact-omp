@@ -22,44 +22,101 @@ The extension never implements a second summarizer. It is a transport adapter fr
 For now, git clone + local install:
 
 ```bash
-git clone https://github.com/thejorgg/relace-compact-omp relace-compact-omp
-cd relace-compact-omp
-omp plugin link .
+pi install npm:relace-compact-pi
 # or
-pi install .
+omp plugin install npm:relace-compact-pi
 ```
+
+For local development:
+
+```bash
+git clone https://github.com/thejorgg/relace-compact-pi relace-compact-pi
+cd relace-compact-pi
+omp plugin install .
+# or
+pi plugin install .
+```
+
+## Configure target and thresholds through the command
+
+You can just run:
+
+``
+/compact-relace target [value]
+/compact-relace threshold [value]
+``
+
+inside pi or omp
 
 ## Configure OMP (context-full only) 🧩
 
-OMP's automatic `handoff`, `snapcompact`, `shake`, and `off` strategies are not replaced. Select **Context-full** in OMP's compaction settings:
+OMP's automatic `handoff`, `snapcompact`, `shake`, and `off` strategies are not replaced. Select **Context-full** in OMP's compaction settings.
+
+### 1. Set the Compaction Strategy and Idle Settings
+
+Edit your global configuration (`~/.omp/agent/config.yml`) or your project-local configuration (`.omp/config.yml`) under the `compaction:` block. The plugin automatically respects your native OMP idle settings (`idleEnabled` and `idleTimeoutSeconds`):
 
 ```yaml
 compaction:
   strategy: context-full
+  idleEnabled: true
+  idleTimeoutSeconds: 1800
 ```
 
-Then configure the plugin:
+> [!IMPORTANT]
+> Compaction Strategy must be `context-full` for Relace routing to be active in OMP. The command `/compact-relace status` will show a notice when OMP is not set to `context-full`.
+
+For the idle model overrides, use the following:
+```bash
+omp plugin config set relace-compact-pi relace.idleModelOverrides "{\"openai/gpt*\":1800,\"openai-codex/gpt*\":1800,\"anthropic/claude*\":300}"
+```
+
+Alternatively, use the JSON:
+
+Linux / macOS:
+`$HOME/.omp/plugins/omp-plugins.lock.json`
+
+Windows (⚠️ unconfirmed):
+`%appdata%/.omp/plugins/omp-plugins.lock.json`
+
+```json
+{
+  "plugins": {
+    "relace-compact-pi": {
+      "version": "0.1.0",
+      "enabledFeatures": null,
+      "enabled": true
+    }
+  },
+  "settings": {
+    "relace-compact-pi": {
+      "relace.idleModelOverrides": "{\"openai/gpt*\":1800,\"openai-codex/gpt*\":1800,\"anthropic/claude*\":300}"
+    }
+  }
+}
+```
+
+
+### 2. Configure the Relace API Key
+
+The only plugin-specific setting you need to configure is your API key.
+
+
+#### Option A: Environment variable (Recommended)
 
 ```bash
-omp plugin config relace-compact-omp --set relace.apiKey="$RELACE_API_KEY"
-omp plugin config relace-compact-omp --set relace.targetPercent=50
+export RELACE_API_KEY="YOUR_RELACE_API_KEY"
 ```
 
-Or use the OMP plugin settings UI. The important requirement is:
+#### Option B: Using the OMP CLI
 
-> **Compaction Strategy must be `context-full` for Relace routing to be active in OMP.**
-
-`/compact-relace status` shows a notice when OMP is not set to `context-full`:
-
-```text
-Notice: change Compaction Strategy to context-full to use Relace.
+```bash
+omp plugin config relace-compact-pi set relace.apiKey "YOUR_RELACE_API_KEY"
 ```
-
-Relace's target is model-relative: `relace.targetPercent: 50` requests approximately half of the active model's context window as the post-compaction target. The status command displays both the percentage and the calculated token target.
 
 ## Configure pi-agent 🤖
 
-Pi-agent reads global settings from `~/.pi/agent/settings.json` (or `$PI_CODING_AGENT_DIR/settings.json`) and trusted project settings from `.pi/settings.json`.
+Pi-agent reads global settings from `$HOME/.pi/agent/settings.json` (or `$PI_CODING_AGENT_DIR/settings.json`) and trusted project settings from `.pi/settings.json`.
 
 ```json
 {
@@ -67,12 +124,12 @@ Pi-agent reads global settings from `~/.pi/agent/settings.json` (or `$PI_CODING_
     "enabled": true,
     "apiKey": "",
     "endpoint": "https://compact.endpoint.relace.run/v1/code/compact",
-    "targetPercent": 50,
+    "targetPercent": 33,
     "idleTimeoutSeconds": 300,
     "idleModelOverrides": "{\"openai/gpt*\":1800,\"anthropic/claude*\":300}",
     "pi": {
       "thresholdType": "percentage",
-      "threshold": 80
+      "threshold": 66
     }
   }
 }
@@ -85,11 +142,11 @@ Pi-agent reads global settings from `~/.pi/agent/settings.json` (or `$PI_CODING_
 | `relace.enabled` | `true` | Enable or disable Relace routing. |
 | `relace.apiKey` | empty | Relace API key. `RELACE_API_KEY` takes precedence. |
 | `relace.endpoint` | production endpoint | Relace Compact endpoint. |
-| `relace.targetPercent` | `50` | Target percentage of the active model context. |
+| `relace.targetPercent` | `33` | Target percentage of the active model context. |
 | `relace.idleTimeoutSeconds` | `300` | Global idle compaction delay; `0` disables it. |
 | `relace.idleModelOverrides` | `{}` | JSON string mapping model globs to idle seconds. |
 | `relace.pi.thresholdType` | `percentage` | Pi threshold interpretation: `percentage` or `tokens`. |
-| `relace.pi.threshold` | `80` | Pi compaction threshold. |
+| `relace.pi.threshold` | `66` | Pi compaction threshold. |
 
 Model override examples:
 
@@ -108,6 +165,8 @@ A pattern containing `/` matches `provider/model`; a pattern without `/` matches
 /compact-relace enable
 /compact-relace disable
 /compact-relace reset
+/compact-relace target [value]
+/compact-relace threshold [value]
 ```
 
 - Bare `/compact-relace` prints usage.
@@ -116,6 +175,8 @@ A pattern containing `/` matches `provider/model`; a pattern without `/` matches
 - `disable` persists `relace.enabled: false`.
 - `enable` persists `relace.enabled: true`.
 - `reset` clears the current session's replacement history and counter.
+- `target [value]` views the current target percentage, or sets it (e.g. `25%` or `25`).
+- `threshold [value]` views the current threshold, or sets it (e.g. `66%`, `5000`, or `5000 tokens`).
 
 ## API key and privacy 🔒
 
@@ -133,7 +194,3 @@ bun run check
 bun run lint
 bun run fmt
 ```
-
-## License
-
-MIT © The Relace Compact contributors

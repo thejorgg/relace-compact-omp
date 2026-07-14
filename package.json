@@ -1,6 +1,6 @@
 {
 	"type": "module",
-	"name": "relace-compact-omp",
+	"name": "relace-compact-pi",
 	"version": "0.1.0",
 	"description": "Relace Compact routing for OMP and pi-agent",
 	"homepage": "https://omp.sh",
@@ -8,7 +8,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/thejorgg/relace-compact-omp.git"
+		"url": "git+https://github.com/thejorgg/relace-compact-pi.git"
 	},
 	"scripts": {
 		"check": "biome check . && bun run check:types",
@@ -57,7 +57,7 @@
 			},
 			"relace.targetPercent": {
 				"type": "number",
-				"default": 50,
+				"default": 33,
 				"min": 1,
 				"max": 100,
 				"description": "Target percentage of the active model context after compaction."
@@ -99,7 +99,7 @@
 			},
 			"relace.targetPercent": {
 				"type": "number",
-				"default": 50,
+				"default": 33,
 				"min": 1,
 				"max": 100,
 				"description": "Target percentage of the active model context after compaction."
@@ -126,7 +126,7 @@
 			},
 			"relace.pi.threshold": {
 				"type": "number",
-				"default": 80,
+				"default": 66,
 				"min": 1,
 				"description": "Pi auto-compaction threshold value."
 			}
