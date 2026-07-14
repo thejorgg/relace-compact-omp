@@ -242,6 +242,21 @@ function isPluginEnabled(): boolean {
 	return typeof val === "boolean" ? val : true;
 }
 
+/**
+ * Returns true if the active compaction strategy is one that Relace can honor.
+ * Relace does in-place summarization (context-full) and can feed a handoff doc.
+ * It cannot do snapcompact (vision bitmap), shake (surgical drop), or off.
+ */
+function isRelaceCompatibleStrategy(): boolean {
+	const strategy = looseSettings.get("compaction.strategy");
+	return strategy === "context-full" || strategy === "handoff";
+}
+
+function getCompactionStrategy(): string {
+	const val = looseSettings.get("compaction.strategy");
+	return typeof val === "string" ? val : "snapcompact";
+}
+
 function getApiKey(): string {
 	const val = looseSettings.get("relace.apiKey");
 	return typeof val === "string" ? val : "";
@@ -446,6 +461,9 @@ async function onSessionBeforeCompact(
 	if (!isPluginEnabled()) {
 		return;
 	}
+	if (!isRelaceCompatibleStrategy()) {
+		return;
+	}
 	const apiKey = getApiKey();
 	if (!apiKey) {
 		return;
@@ -511,6 +529,9 @@ async function onContext(
 	ctx: ExtensionContext,
 ): Promise<{ messages: AgentMessage[] } | undefined> {
 	if (!isPluginEnabled()) {
+		return undefined;
+	}
+	if (!isRelaceCompatibleStrategy()) {
 		return undefined;
 	}
 
@@ -582,9 +603,14 @@ function handleStatusCommand(ctx: ExtensionCommandContext): void {
 	const state = getSessionState(sessionId);
 	const currentTokens = ctx.getContextUsage()?.tokens ?? 0;
 	const isEnabled = isPluginEnabled();
+	const strategy = getCompactionStrategy();
+	const strategyHonored = isRelaceCompatibleStrategy();
 
 	console.log(`Relace Compact Status — Session ${sessionId}:`);
 	console.log(`  Plugin enabled: ${isEnabled}`);
+	console.log(
+		`  Strategy:       ${strategy}${strategyHonored ? " (honored)" : " (ignored — Relace only handles context-full and handoff)"}`,
+	);
 	console.log(
 		`  Cached:         ${state.compactedMessages ? `Yes (${state.compactedMessages.length} messages, ${state.compactionCount} compactions)` : "No"}`,
 	);
@@ -596,7 +622,52 @@ function handleStatusCommand(ctx: ExtensionCommandContext): void {
 function handleResetCommand(ctx: ExtensionCommandContext): void {
 	const sessionId = ctx.sessionManager.getSessionId();
 	sessionStates.delete(sessionId);
-	console.log(`Relace compact cache cleared for session ${sessionId}.`);
+	console.log(
+		`Relace compact cache cleared for session ${sessionId}. Next turn will re-compact if thresholds are met.`,
+	);
+}
+
+/**
+ * Force a compaction immediately. This clears the cache and triggers performCompaction
+ * on the current session messages via ctx.compact(), which fires the session_before_compact
+ * hook that routes through Relace.
+ */
+async function handleCompactCommand(
+	ctx: ExtensionCommandContext,
+): Promise<void> {
+	const sessionId = ctx.sessionManager.getSessionId();
+	const apiKey = getApiKey();
+
+	if (!isPluginEnabled()) {
+		console.log("Relace Compact is disabled. Enable it with relace.enabled.");
+		return;
+	}
+	if (!isRelaceCompatibleStrategy()) {
+		console.log(
+			`Current compaction strategy "${getCompactionStrategy()}" is not compatible with Relace. Set compaction.strategy to "context-full" or "handoff".`,
+		);
+		return;
+	}
+	if (!apiKey) {
+		console.log(
+			"Relace API key not configured. Set relace.apiKey in settings or RELACE_API_KEY env var.",
+		);
+		return;
+	}
+
+	// Clear cache so the next context event doesn't skip
+	sessionStates.delete(sessionId);
+
+	console.log("Forcing Relace compaction via native /compact...");
+	try {
+		await ctx.compact("Compact via Relace Compact");
+		console.log("Relace compaction triggered successfully.");
+	} catch (err) {
+		console.error(
+			"[relace-compact] forced compaction failed:",
+			err instanceof Error ? err.message : err,
+		);
+	}
 }
 
 // ============================================================================
@@ -623,7 +694,7 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 	// Hook for OMP native compaction to reroute via Relace.
 	pi.on("session_before_compact", onSessionBeforeCompact);
 
-	// Slash commands for introspection.
+	// Slash commands for introspection and forced compaction.
 	pi.registerCommand("relace", {
 		description: "Inspect or manage Relace Compact state",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
@@ -631,8 +702,11 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 				const sub = args.trim();
 				if (sub === "status") handleStatusCommand(ctx);
 				else if (sub === "reset") handleResetCommand(ctx);
+				else if (sub === "compact") await handleCompactCommand(ctx);
 				else {
-					console.log("Usage: /relace status | /relace reset");
+					console.log(
+						"Usage: /relace status | /relace reset | /relace compact",
+					);
 				}
 			} catch (err) {
 				console.error("[relace-compact] Command execution error:", err);
