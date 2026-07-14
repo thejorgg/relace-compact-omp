@@ -83,6 +83,57 @@
 			}
 		}
 	},
+	"pi": {
+		"extensions": [
+			"./src/extension.ts"
+		],
+		"settings": {
+			"relace.enabled": {
+				"type": "boolean",
+				"default": true,
+				"ui": {
+					"label": "Enable Relace Compaction",
+					"description": "Whether to use Relace Compact to compress conversation history."
+				}
+			},
+			"relace.apiKey": {
+				"type": "string",
+				"default": "",
+				"ui": {
+					"label": "Relace API Key",
+					"description": "API key from app.relace.ai to authorize compaction requests."
+				}
+			},
+			"relace.endpoint": {
+				"type": "string",
+				"default": "https://compact.endpoint.relace.run/v1/code/compact",
+				"ui": {
+					"label": "Relace Compact Endpoint",
+					"description": "API URL for trace compaction (can be changed to swap endpoints)."
+				}
+			},
+			"relace.targetTokens": {
+				"type": "number",
+				"default": 128000,
+				"ui": {
+					"label": "Relace Target Tokens / Percent",
+					"description": "Integer token budget, or percentage of the active model context when threshold type is percentage."
+				}
+			},
+			"relace.thresholdtype": {
+				"type": "enum",
+				"values": [
+					"integer",
+					"percentage"
+				],
+				"default": "integer",
+				"ui": {
+					"label": "Relace Threshold Type",
+					"description": "Interpret the target as tokens or as a percentage of the active model context."
+				}
+			}
+		}
+	},
 	"files": [
 		"src",
 		"README.md",

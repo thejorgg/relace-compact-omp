@@ -68,7 +68,7 @@ interface SessionState {
 interface LooseSettings {
 	get(key: string): unknown;
 }
-const looseSettings = settings as unknown as LooseSettings;
+let looseSettings: LooseSettings;
 
 // ============================================================================
 // Constants
@@ -108,6 +108,12 @@ function isPluginEnabled(): boolean {
 }
 
 function getApiKey(): string {
+	if (process.env.RELACE_API_KEY) {
+		return process.env.RELACE_API_KEY;
+	}
+	if (process.env.RELACE_API_TOKEN) {
+		return process.env.RELACE_API_TOKEN;
+	}
 	const val = looseSettings.get("relace.apiKey");
 	return typeof val === "string" ? val : "";
 }
@@ -469,6 +475,8 @@ function handleResetCommand(ctx: ExtensionCommandContext): void {
 // ============================================================================
 
 export default function relaceCompactExtension(pi: ExtensionAPI): void {
+	looseSettings = (pi.pi?.Settings?.instance ||
+		settings) as unknown as LooseSettings;
 	pi.setLabel("Relace Compact");
 
 	// Core event: intercept outbound LLM context to inject compacted messages.
