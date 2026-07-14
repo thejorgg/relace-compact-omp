@@ -2,7 +2,7 @@
 	"type": "module",
 	"name": "relace-compact-omp",
 	"version": "0.1.0",
-	"description": "Relace Compact trace compaction integration for oh-my-pi",
+	"description": "Relace Compact routing for OMP and pi-agent",
 	"homepage": "https://omp.sh",
 	"author": "Antigravity",
 	"license": "MIT",
@@ -30,6 +30,7 @@
 		"@earendil-works/pi-ai": "^0.80.6"
 	},
 	"engines": {
+		"node": ">=22.19.0",
 		"bun": ">=1.3.14"
 	},
 	"omp": {
@@ -40,54 +41,36 @@
 			"relace.enabled": {
 				"type": "boolean",
 				"default": true,
-				"ui": {
-					"label": "Enable Relace Compaction",
-					"description": "Whether to use Relace Compact to compress conversation history."
-				}
+				"description": "Route supported OMP compactions through Relace."
 			},
 			"relace.apiKey": {
 				"type": "string",
 				"default": "",
-				"ui": {
-					"label": "Relace API Key",
-					"description": "API key from app.relace.ai to authorize compaction requests."
-				}
+				"secret": true,
+				"env": "RELACE_API_KEY",
+				"description": "Relace API key."
 			},
 			"relace.endpoint": {
 				"type": "string",
 				"default": "https://compact.endpoint.relace.run/v1/code/compact",
-				"ui": {
-					"label": "Relace Compact Endpoint",
-					"description": "API URL for trace compaction (can be changed to swap endpoints)."
-				}
+				"description": "Relace Compact API endpoint."
 			},
 			"relace.targetTokens": {
 				"type": "number",
 				"default": 128000,
-				"ui": {
-					"label": "Relace Target Tokens / Percent",
-					"description": "Integer token budget, or percentage of the active model context when threshold type is percentage."
-				}
+				"min": 1,
+				"description": "Requested post-compaction token target."
 			},
-			"relace.thresholdtype": {
-				"type": "enum",
-				"values": [
-					"integer",
-					"percentage"
-				],
-				"default": "integer",
-				"ui": {
-					"label": "Relace Threshold Type",
-					"description": "Interpret the target as tokens or as a percentage of the active model context."
-				}
+			"relace.idleTimeoutSeconds": {
+				"type": "number",
+				"default": 300,
+				"min": 0,
+				"description": "Global idle compaction delay in seconds; zero disables idle compaction."
 			},
-			"relace.idleCompactionThresholds": {
-				"type": "object",
-				"default": {},
-				"ui": {
-					"label": "Idle Compaction Thresholds",
-					"description": "Per-model or per-family idle thresholds in seconds (e.g. {\"openai*/gpt*\": 1800})."
-				}
+			"relace.idleModelOverrides": {
+				"type": "string",
+				"default": "{}",
+				"description": "JSON object mapping model globs to idle seconds, for example {\"openai/gpt*\":1800}."
 			}
 		}
 	},
@@ -99,61 +82,55 @@
 			"relace.enabled": {
 				"type": "boolean",
 				"default": true,
-				"ui": {
-					"label": "Enable Relace Compaction",
-					"description": "Whether to use Relace Compact to compress conversation history."
-				}
+				"description": "Route every pi compaction through Relace."
 			},
 			"relace.apiKey": {
 				"type": "string",
 				"default": "",
-				"ui": {
-					"label": "Relace API Key",
-					"description": "API key from app.relace.ai to authorize compaction requests."
-				}
+				"secret": true,
+				"env": "RELACE_API_KEY",
+				"description": "Relace API key."
 			},
 			"relace.endpoint": {
 				"type": "string",
 				"default": "https://compact.endpoint.relace.run/v1/code/compact",
-				"ui": {
-					"label": "Relace Compact Endpoint",
-					"description": "API URL for trace compaction (can be changed to swap endpoints)."
-				}
+				"description": "Relace Compact API endpoint."
 			},
 			"relace.targetTokens": {
 				"type": "number",
 				"default": 128000,
-				"ui": {
-					"label": "Relace Target Tokens / Percent",
-					"description": "Integer token budget, or percentage of the active model context when threshold type is percentage."
-				}
+				"min": 1,
+				"description": "Requested post-compaction token target."
 			},
-			"relace.thresholdtype": {
+			"relace.idleTimeoutSeconds": {
+				"type": "number",
+				"default": 300,
+				"min": 0,
+				"description": "Global idle compaction delay in seconds; zero disables idle compaction."
+			},
+			"relace.idleModelOverrides": {
+				"type": "string",
+				"default": "{}",
+				"description": "JSON object mapping model globs to idle seconds, for example {\"openai/gpt*\":1800}."
+			},
+			"relace.pi.thresholdType": {
 				"type": "enum",
 				"values": [
-					"integer",
-					"percentage"
+					"percentage",
+					"tokens"
 				],
-				"default": "integer",
-				"ui": {
-					"label": "Relace Threshold Type",
-					"description": "Interpret the target as tokens or as a percentage of the active model context."
-				}
+				"default": "percentage",
+				"description": "Interpret the pi auto-compaction threshold as context percentage or token count."
 			},
-			"relace.idleCompactionThresholds": {
-				"type": "object",
-				"default": {},
-				"ui": {
-					"label": "Idle Compaction Thresholds",
-					"description": "Per-model or per-family idle thresholds in seconds (e.g. {\"openai*/gpt*\": 1800})."
-				}
+			"relace.pi.threshold": {
+				"type": "number",
+				"default": 80,
+				"min": 1,
+				"description": "Pi auto-compaction threshold value."
 			}
 		}
 	},
 	"files": [
-		"src",
-		"README.md",
-		"LICENSE",
-		"CHANGELOG.md"
+		"src"
 	]
 }

@@ -1,37 +1,6 @@
-/**
- * Relace Compact Extension — high-speed trace compaction for oh-my-pi.
- *
- * Overrides the compaction transport so that, instead of calling a provider's
- * native summarize endpoint (OpenAI, Claude, etc.), it sends the trace to
- * Relace Compact (or any compatible API) and returns the result.
- *
- * The extension pairs with OMP's built-in auto-compact settings
- * (`compaction.strategy`, `compaction.thresholdTokens`, etc.) rather than
- * duplicating them.
- *
- * Compaction strategy guidance:
- *   - "context-full" — compact the trace in-place (most sessions).
- *   - "snapcompact"  — archive history to dense images (vision models only).
- *   - "off"           — disable auto-compaction entirely; plugin still honors
- *                       manual /compact via session_before_compact (if enabled).
- *
- * Settings it declares:
- *   - relace.apiKey          — API key for the compaction service.
- *   - relace.endpoint        — compaction endpoint URL.
- *   - relace.targetTokens    — approximate token budget post-compaction.
- *
- * Slash commands:
- *   - /relace status        — session compaction cache & settings state.
- *   - /relace reset         — clear cache and force re-compaction next turn.
- */
-
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-	type AgentMessage,
-	type CompactionSummaryMessage,
-	estimateTokens,
-} from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Message, Model } from "@earendil-works/pi-ai";
 import type {
 	ContextEvent,
@@ -41,9 +10,30 @@ import type {
 	SessionBeforeCompactEvent,
 } from "@earendil-works/pi-coding-agent";
 
-// ============================================================================
-// Types
-// ============================================================================
+const PACKAGE_NAME = "relace-compact-omp";
+const RELACE_ENDPOINT = "https://compact.endpoint.relace.run/v1/code/compact";
+const OMP_PLUGINS_MODULE = "@oh-my-pi/pi-coding-agent/extensibility/plugins";
+const DEFAULT_IDLE_SECONDS = 300;
+const DEFAULT_TARGET_TOKENS = 128_000;
+const DEFAULT_PI_THRESHOLD = 80;
+
+type HostKind = "omp" | "pi";
+type PiThresholdType = "percentage" | "tokens";
+type NoticeLevel = "info" | "warning" | "error";
+type SettingsRecord = Record<string, unknown>;
+
+interface DynamicSettings {
+	get(key: string): unknown;
+}
+
+interface OmpPluginManager {
+	setPluginSetting(name: string, key: string, value: unknown): Promise<void>;
+}
+
+interface OmpPluginModule {
+	getPluginSettings(name: string, cwd: string): Promise<SettingsRecord>;
+	PluginManager: new (cwd?: string) => OmpPluginManager;
+}
 
 interface RelaceMessage {
 	role: "user" | "assistant" | "developer" | "tool" | "system";
@@ -51,978 +41,791 @@ interface RelaceMessage {
 	tool_call_id?: string;
 }
 
-interface CompactResponse {
-	messages: Message[];
+interface RelaceConfig {
+	enabled: boolean;
+	apiKey: string;
+	endpoint: string;
+	targetTokens: number;
+	idleTimeoutSeconds: number;
+	idleModelOverrides: ReadonlyArray<readonly [string, number]>;
+	piThresholdType: PiThresholdType;
+	piThreshold: number;
 }
 
 interface SessionState {
-	compactedMessages: Message[] | undefined;
-	/** Number of original messages captured in compactedMessages (for slicing new turns). */
-	originalCountCompacted: number;
-	/** Timestamp when the previous turn ended (for cache miss detection). */
-	lastTurnEndTime: number;
-	/** Number of times this session has been compacted. */
-	compactionCount: number;
+	replacement: Message[] | undefined;
+	compactions: number;
+	idleTimer: ReturnType<typeof setTimeout> | undefined;
+	compactPending: boolean;
 }
 
-// ============================================================================
-// Custom Settings Loader (Workaround for OMP dynamic registration & duplicate package bugs)
-// ============================================================================
-
-interface LooseSettings {
-	get(key: string): unknown;
+interface CompactCallbacks {
+	onComplete?: () => void;
+	onError?: (error: Error) => void;
 }
 
-let activeAgentDir = "";
-let activeCwd = "";
-let yamlConfig: Record<string, unknown> = {};
-let lastLoadedTime = 0;
+function isRecord(value: unknown): value is SettingsRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
-function getAgentDirFallback(): string {
-	if (process.env.PI_CODING_AGENT_DIR) {
-		return process.env.PI_CODING_AGENT_DIR;
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	return isRecord(value) && typeof value.then === "function";
+}
+
+function toError(value: unknown): Error {
+	return value instanceof Error ? value : new Error(String(value));
+}
+
+function getPathValue(values: SettingsRecord, key: string): unknown {
+	if (key in values) return values[key];
+	let current: unknown = values;
+	for (const segment of key.split(".")) {
+		if (!isRecord(current) || !(segment in current)) return undefined;
+		current = current[segment];
 	}
-	const home = process.env.HOME || process.env.USERPROFILE || "";
-	// Check pi-agent path first, then OMP path
-	const piAgentDir = path.join(home, ".pi", "agent");
-	if (fs.existsSync(piAgentDir)) {
-		return piAgentDir;
+	return current;
+}
+
+function setPathValue(
+	values: SettingsRecord,
+	key: string,
+	value: unknown,
+): void {
+	const segments = key.split(".");
+	let current = values;
+	for (const segment of segments.slice(0, -1)) {
+		const child = current[segment];
+		if (isRecord(child)) current = child;
+		else {
+			const created: SettingsRecord = {};
+			current[segment] = created;
+			current = created;
+		}
 	}
-	return path.join(home, ".omp", "agent");
+	const leaf = segments.at(-1);
+	if (leaf) current[leaf] = value;
 }
 
-/**
- * Minimal YAML subset parser — handles flat keys, nested maps, and simple lists.
- * Supports the OMP/pi config.yml format:
- *   key: value
- *   parent:
- *     child: value
- *   list:
- *     - item1
- *     - item2
- * Does NOT support: multiline strings, anchors, aliases, flow style, tags.
- * Works in both Bun and Node.js runtimes (no Bun.YAML dependency).
- */
-function parseSimpleYAML(content: string): Record<string, unknown> {
-	return _parseYAMLInternal(content.split("\n"));
+function mergeSettings(
+	base: SettingsRecord,
+	override: SettingsRecord,
+): SettingsRecord {
+	const merged: SettingsRecord = { ...base };
+	for (const [key, value] of Object.entries(override)) {
+		const baseValue = merged[key];
+		merged[key] =
+			isRecord(baseValue) && isRecord(value)
+				? mergeSettings(baseValue, value)
+				: value;
+	}
+	return merged;
 }
 
-function _parseYAMLInternal(lines: string[]): Record<string, unknown> {
-	const root: Record<string, unknown> = {};
+function readJsonObject(filePath: string): SettingsRecord {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
+		if (!isRecord(parsed))
+			throw new Error(`${filePath} must contain a JSON object.`);
+		return parsed;
+	} catch (error) {
+		if (isRecord(error) && error.code === "ENOENT") return {};
+		throw error;
+	}
+}
 
-	type Frame = {
-		obj: Record<string, unknown> | unknown[];
-		indent: number;
+function writeJsonObject(filePath: string, values: SettingsRecord): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	const temporaryPath = `${filePath}.${process.pid}.tmp`;
+	fs.writeFileSync(
+		temporaryPath,
+		`${JSON.stringify(values, null, "\t")}\n`,
+		"utf8",
+	);
+	fs.renameSync(temporaryPath, filePath);
+}
+
+function findOmpSettings(pi: ExtensionAPI): DynamicSettings | undefined {
+	const extensionApi: unknown = pi;
+	if (!isRecord(extensionApi) || !isRecord(extensionApi.pi)) return undefined;
+	const candidate = extensionApi.pi.settings;
+	if (!isRecord(candidate) || typeof candidate.get !== "function")
+		return undefined;
+	return candidate as unknown as DynamicSettings;
+}
+
+async function loadOmpPluginModule(): Promise<OmpPluginModule> {
+	const loaded: unknown = await import(OMP_PLUGINS_MODULE);
+	if (
+		!isRecord(loaded) ||
+		typeof loaded.getPluginSettings !== "function" ||
+		typeof loaded.PluginManager !== "function"
+	) {
+		throw new Error("OMP plugin settings API is unavailable.");
+	}
+	return {
+		getPluginSettings:
+			loaded.getPluginSettings as OmpPluginModule["getPluginSettings"],
+		PluginManager: loaded.PluginManager as OmpPluginModule["PluginManager"],
 	};
+}
 
-	// Root frame sits at indent -2 so any indent >= 0 stays inside it
-	const stack: Frame[] = [{ obj: root, indent: -2 }];
-
-	for (let i = 0; i < lines.length; i++) {
-		const rawLine = lines[i];
-		const commentIdx = rawLine.indexOf("#");
-		const line = commentIdx !== -1 ? rawLine.slice(0, commentIdx) : rawLine;
-		if (line.trim() === "") continue;
-
-		const indent = line.search(/\S/);
-		const trimmed = line.trim();
-
-		// Pop stack to find the correct parent: pop frames at the same or deeper indent
-		while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
-			stack.pop();
+function parseIdleOverrides(
+	value: unknown,
+): ReadonlyArray<readonly [string, number]> {
+	let parsed = value;
+	if (typeof value === "string") {
+		try {
+			parsed = JSON.parse(value) as unknown;
+		} catch {
+			return [];
 		}
+	}
+	if (!isRecord(parsed)) return [];
+	const overrides: Array<readonly [string, number]> = [];
+	for (const [pattern, seconds] of Object.entries(parsed)) {
+		if (typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0)
+			overrides.push([pattern, seconds]);
+	}
+	return overrides;
+}
 
-		const parentFrame = stack[stack.length - 1];
-		const parent = parentFrame.obj;
+function positiveNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? value
+		: fallback;
+}
 
-		// List item at this level
-		if (trimmed.startsWith("- ")) {
-			if (!Array.isArray(parent)) continue;
-			const val = trimmed.slice(2).trim();
-			parent.push(parseYAMLValue(val));
-			continue;
+function nonNegativeNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? value
+		: fallback;
+}
+
+function endpointSetting(value: unknown): string {
+	if (typeof value !== "string" || value.length === 0) return RELACE_ENDPOINT;
+	try {
+		const parsed = new URL(value);
+		return parsed.protocol === "https:" || parsed.protocol === "http:"
+			? parsed.toString()
+			: RELACE_ENDPOINT;
+	} catch {
+		return RELACE_ENDPOINT;
+	}
+}
+
+function buildConfig(
+	values: SettingsRecord,
+	enabledOverride: boolean | undefined,
+): RelaceConfig {
+	const configuredKey = getPathValue(values, "relace.apiKey");
+	const apiKey =
+		process.env.RELACE_API_KEY ??
+		process.env.RELACE_API_TOKEN ??
+		(typeof configuredKey === "string" ? configuredKey : "");
+	const thresholdType = getPathValue(values, "relace.pi.thresholdType");
+	return {
+		enabled:
+			enabledOverride ?? getPathValue(values, "relace.enabled") !== false,
+		apiKey,
+		endpoint: endpointSetting(getPathValue(values, "relace.endpoint")),
+		targetTokens: Math.round(
+			positiveNumber(
+				getPathValue(values, "relace.targetTokens"),
+				DEFAULT_TARGET_TOKENS,
+			),
+		),
+		idleTimeoutSeconds: nonNegativeNumber(
+			getPathValue(values, "relace.idleTimeoutSeconds"),
+			DEFAULT_IDLE_SECONDS,
+		),
+		idleModelOverrides: parseIdleOverrides(
+			getPathValue(values, "relace.idleModelOverrides"),
+		),
+		piThresholdType: thresholdType === "tokens" ? "tokens" : "percentage",
+		piThreshold: positiveNumber(
+			getPathValue(values, "relace.pi.threshold"),
+			DEFAULT_PI_THRESHOLD,
+		),
+	};
+}
+
+class SettingsStore {
+	readonly host: HostKind;
+	readonly #ompSettings: DynamicSettings | undefined;
+	#cacheKey = "";
+	#cachedConfig: RelaceConfig | undefined;
+	#enabledOverride: boolean | undefined;
+	#ompModule: Promise<OmpPluginModule> | undefined;
+
+	constructor(host: HostKind, ompSettings: DynamicSettings | undefined) {
+		this.host = host;
+		this.#ompSettings = ompSettings;
+	}
+
+	async getConfig(ctx: ExtensionContext): Promise<RelaceConfig> {
+		const trusted = this.host === "omp" || ctx.isProjectTrusted();
+		const cacheKey = `${ctx.cwd}\u0000${trusted}`;
+		if (this.#cachedConfig && this.#cacheKey === cacheKey)
+			return this.#cachedConfig;
+		let values: SettingsRecord;
+		if (this.host === "omp")
+			values = await (await this.#getOmpModule()).getPluginSettings(
+				PACKAGE_NAME,
+				ctx.cwd,
+			);
+		else {
+			const agentDir =
+				process.env.PI_CODING_AGENT_DIR ??
+				path.join(process.env.HOME ?? "", ".pi", "agent");
+			const globalValues = readJsonObject(path.join(agentDir, "settings.json"));
+			const projectValues = trusted
+				? readJsonObject(path.join(ctx.cwd, ".pi", "settings.json"))
+				: {};
+			values = mergeSettings(globalValues, projectValues);
 		}
+		this.#cacheKey = cacheKey;
+		this.#cachedConfig = buildConfig(values, this.#enabledOverride);
+		return this.#cachedConfig;
+	}
 
-		// Key: value pair
-		const colonIdx = trimmed.indexOf(":");
-		if (colonIdx === -1) continue;
-		const key = trimmed.slice(0, colonIdx).trim();
-		const rawVal = trimmed.slice(colonIdx + 1).trim();
+	getOmpStrategy(): "context-full" | "handoff" | undefined {
+		const value = this.#ompSettings?.get("compaction.strategy");
+		return value === "context-full" || value === "handoff" ? value : undefined;
+	}
 
-		if (rawVal === "") {
-			// Nested structure follows — peek ahead to determine if it's a map or list
-			let nextIndent = -1;
-			let nextIsList = false;
-			for (let j = i + 1; j < lines.length; j++) {
-				const nl = lines[j].replace(/#.*$/, "");
-				if (nl.trim() === "") continue;
-				nextIndent = nl.search(/\S/);
-				nextIsList = nl.trim().startsWith("- ");
+	async setEnabled(cwd: string, enabled: boolean): Promise<void> {
+		this.#enabledOverride = enabled;
+		if (this.host === "omp") {
+			const module = await this.#getOmpModule();
+			await new module.PluginManager(cwd).setPluginSetting(
+				PACKAGE_NAME,
+				"relace.enabled",
+				enabled,
+			);
+		} else {
+			const agentDir =
+				process.env.PI_CODING_AGENT_DIR ??
+				path.join(process.env.HOME ?? "", ".pi", "agent");
+			const settingsPath = path.join(agentDir, "settings.json");
+			const values = readJsonObject(settingsPath);
+			setPathValue(values, "relace.enabled", enabled);
+			writeJsonObject(settingsPath, values);
+		}
+		this.#cachedConfig = undefined;
+	}
+
+	#getOmpModule(): Promise<OmpPluginModule> {
+		this.#ompModule ??= loadOmpPluginModule();
+		return this.#ompModule;
+	}
+}
+
+function globMatches(value: string, pattern: string): boolean {
+	const escaped = pattern
+		.split("*")
+		.map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+		.join(".*");
+	return new RegExp(`^${escaped}$`, "i").test(value);
+}
+
+function idleTimeoutForModel(
+	config: RelaceConfig,
+	model: Model<Api> | undefined,
+): number {
+	if (!model) return config.idleTimeoutSeconds;
+	const fullName = `${model.provider}/${model.id}`;
+	for (const [pattern, seconds] of config.idleModelOverrides) {
+		if (globMatches(pattern.includes("/") ? fullName : model.id, pattern))
+			return seconds;
+	}
+	return config.idleTimeoutSeconds;
+}
+
+function piThresholdTokens(
+	config: RelaceConfig,
+	model: Model<Api> | undefined,
+): number | undefined {
+	if (config.piThresholdType === "tokens")
+		return Math.round(config.piThreshold);
+	if (!model?.contextWindow) return undefined;
+	return Math.round(
+		(model.contextWindow * Math.min(config.piThreshold, 100)) / 100,
+	);
+}
+
+function supportsRoute(settings: SettingsStore): boolean {
+	return settings.host === "pi" || settings.getOmpStrategy() !== undefined;
+}
+
+function toRelaceMessages(messages: AgentMessage[]): RelaceMessage[] {
+	const converted: RelaceMessage[] = [];
+	for (const message of messages) {
+		switch (message.role) {
+			case "user":
+			case "assistant":
+				converted.push({ role: message.role, content: message.content });
 				break;
-			}
-
-			if (nextIndent > indent) {
-				if (nextIsList) {
-					const arr: unknown[] = [];
-					if (Array.isArray(parent)) continue;
-					parent[key] = arr;
-					// Frame indent = current indent (children are deeper)
-					stack.push({ obj: arr, indent });
-				} else {
-					const obj: Record<string, unknown> = {};
-					if (Array.isArray(parent)) continue;
-					parent[key] = obj;
-					// Frame indent = current indent (children are deeper)
-					stack.push({ obj, indent });
-				}
-			} else {
-				// Nothing follows at deeper indent — null value
-				if (!Array.isArray(parent)) {
-					parent[key] = null;
-				}
-			}
-		} else {
-			const val = parseYAMLValue(rawVal);
-			if (Array.isArray(parent)) continue;
-			parent[key] = val;
-		}
-	}
-
-	return root;
-}
-
-function parseYAMLValue(raw: string): unknown {
-	const trimmed = raw.trim();
-	if (trimmed === "true") return true;
-	if (trimmed === "false") return false;
-	if (trimmed === "null" || trimmed === "~") return null;
-	if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10);
-	if (/^-?\d+\.\d+$/.test(trimmed)) return parseFloat(trimmed);
-	if (
-		(trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-		(trimmed.startsWith("'") && trimmed.endsWith("'"))
-	) {
-		return trimmed.slice(1, -1);
-	}
-	return trimmed;
-}
-
-function loadYamlSettings(
-	agentDir: string,
-	cwd: string,
-): Record<string, unknown> {
-	const config: Record<string, unknown> = {};
-
-	// 1. Read global config (config.yml or settings.json)
-	const globalConfigPath = path.join(agentDir, "config.yml");
-	const globalSettingsPath = path.join(agentDir, "settings.json");
-
-	if (fs.existsSync(globalConfigPath)) {
-		try {
-			const content = fs.readFileSync(globalConfigPath, "utf8");
-			const parsed = parseSimpleYAML(content);
-			if (parsed && typeof parsed === "object") {
-				Object.assign(config, parsed);
-			}
-		} catch (_e) {
-			// ignore
-		}
-	} else if (fs.existsSync(globalSettingsPath)) {
-		try {
-			const content = fs.readFileSync(globalSettingsPath, "utf8");
-			const parsed = JSON.parse(content) as Record<string, unknown>;
-			if (parsed && typeof parsed === "object") {
-				Object.assign(config, parsed);
-			}
-		} catch (_e) {
-			// ignore
-		}
-	}
-
-	// 2. Read project config (check .omp, .pi, and .claude config locations)
-	const projectPaths = [
-		path.join(cwd, ".omp", "config.yml"),
-		path.join(cwd, ".pi", "config.yml"),
-		path.join(cwd, "config.yml"),
-		path.join(cwd, ".claude", "config.yml"),
-		path.join(cwd, ".pi", "settings.json"),
-		path.join(cwd, "settings.json"),
-	];
-	for (const p of projectPaths) {
-		if (fs.existsSync(p)) {
-			try {
-				const content = fs.readFileSync(p, "utf8");
-				const parsed = p.endsWith(".json")
-					? (JSON.parse(content) as Record<string, unknown>)
-					: parseSimpleYAML(content);
-				if (parsed && typeof parsed === "object") {
-					Object.assign(config, parsed);
-				}
-				break; // Only load the first matching project config
-			} catch (_e) {
-				// ignore
-			}
-		}
-	}
-
-	return config;
-}
-
-function getFromConfig(config: Record<string, unknown>, key: string): unknown {
-	if (key in config) {
-		return config[key];
-	}
-	const parts = key.split(".");
-	let val: unknown = config;
-	for (const part of parts) {
-		if (
-			val &&
-			typeof val === "object" &&
-			part in (val as Record<string, unknown>)
-		) {
-			val = (val as Record<string, unknown>)[part];
-		} else {
-			return undefined;
-		}
-	}
-	return val;
-}
-
-function ensureConfigLoaded() {
-	const agentDir = activeAgentDir || getAgentDirFallback();
-	const cwd = activeCwd || process.cwd();
-
-	// Throttle config file reads to at most once every 5 seconds
-	if (Date.now() - lastLoadedTime < 5000) {
-		return;
-	}
-	yamlConfig = loadYamlSettings(agentDir, cwd);
-	lastLoadedTime = Date.now();
-}
-
-const looseSettings: LooseSettings = {
-	get(key: string): unknown {
-		// 1. Environment variables override
-		if (key === "relace.apiKey") {
-			if (process.env.RELACE_API_KEY) return process.env.RELACE_API_KEY;
-			if (process.env.RELACE_API_TOKEN) return process.env.RELACE_API_TOKEN;
-		}
-
-		// 2. Read config from files
-		ensureConfigLoaded();
-		const val = getFromConfig(yamlConfig, key);
-		if (val !== undefined) {
-			return val;
-		}
-
-		// 3. Default fallbacks
-		switch (key) {
-			case "relace.enabled":
-				return true;
-			case "relace.apiKey":
-				return "";
-			case "relace.endpoint":
-				return RELACE_ENDPOINT_DEFAULT;
-			case "relace.targetTokens":
-				return 128000;
-			case "relace.thresholdtype":
-				return "integer";
-			case "relace.idleCompactionThresholds":
-				return {};
-			case "compaction.idleTimeoutSeconds":
-				return 300;
-			case "compaction.idleThresholdTokens":
-				return 200000;
-			case "compaction.tokenLimit":
-				return 0;
+			case "toolResult":
+				converted.push({
+					role: "tool",
+					tool_call_id: message.toolCallId,
+					content: message.content,
+				});
+				break;
+			case "compactionSummary":
+			case "branchSummary":
+				converted.push({ role: "developer", content: message.summary });
+				break;
+			case "custom":
+				converted.push({ role: "developer", content: message.content });
+				break;
+			case "bashExecution":
+				converted.push({
+					role: "tool",
+					content: `$ ${message.command}\n${message.output}`,
+				});
+				break;
 			default:
-				return undefined;
+				converted.push({ role: "developer", content: JSON.stringify(message) });
 		}
-	},
-};
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-const COMPACTION_SUMMARY_ROLE = "compactionSummary";
-const RELACE_ENDPOINT_DEFAULT =
-	"https://compact.endpoint.relace.run/v1/code/compact";
-
-// ============================================================================
-// Session State
-// ============================================================================
-
-const sessionStates = new Map<string, SessionState>();
-
-function getSessionState(sessionId: string): SessionState {
-	let state = sessionStates.get(sessionId);
-	if (!state) {
-		state = {
-			compactedMessages: undefined,
-			originalCountCompacted: 0,
-			lastTurnEndTime: Date.now(),
-			compactionCount: 0,
-		};
-		sessionStates.set(sessionId, state);
 	}
-	return state;
+	return converted;
 }
 
-// ============================================================================
-// Settings
-// ============================================================================
-
-function isPluginEnabled(): boolean {
-	const val = looseSettings.get("relace.enabled");
-	return typeof val === "boolean" ? val : true;
-}
-
-function isOmp(): boolean {
-	const agentDir = activeAgentDir || getAgentDirFallback();
-	return agentDir.includes(".omp");
-}
-
-/**
- * Returns true if the active compaction strategy is one that Relace can honor.
- * Relace does in-place summarization (context-full) and can feed a handoff doc.
- * It cannot do snapcompact (vision bitmap), shake (surgical drop), or off.
- */
-function isRelaceCompatibleStrategy(): boolean {
-	if (!isOmp()) {
-		// In regular pi-agent, we always run context-full compaction
-		return true;
-	}
-	const strategy = looseSettings.get("compaction.strategy");
-	return strategy === "context-full" || strategy === "handoff";
-}
-
-function getCompactionStrategy(): string {
-	if (!isOmp()) {
-		return "context-full";
-	}
-	const val = looseSettings.get("compaction.strategy");
-	return typeof val === "string" ? val : "snapcompact";
-}
-
-function getApiKey(): string {
-	const val = looseSettings.get("relace.apiKey");
-	return typeof val === "string" ? val : "";
-}
-
-function getEndpoint(): string {
-	const val = looseSettings.get("relace.endpoint");
-	return typeof val === "string" ? val : RELACE_ENDPOINT_DEFAULT;
-}
-
-function getTargetTokens(model?: Model<Api>): number {
-	const val = looseSettings.get("relace.targetTokens");
-	const target =
-		typeof val === "number" && Number.isFinite(val) && val > 0 ? val : 128_000;
-	const thresholdType = looseSettings.get("relace.thresholdtype");
+function parseRelaceMessages(value: unknown): RelaceMessage[] {
 	if (
-		thresholdType === "percentage" &&
-		model?.contextWindow &&
-		model.contextWindow > 0
-	) {
-		return Math.round((model.contextWindow * Math.min(target, 100)) / 100);
-	}
-	return Math.round(target);
-}
-
-function matchGlob(str: string, pattern: string): boolean {
-	const escapeRegex = (s: string) =>
-		s.replace(/([.*+?^=!:${}()|[\]/\\])/g, "\\$1");
-	const regexStr = `^${pattern.split("*").map(escapeRegex).join(".*")}$`;
-	return new RegExp(regexStr, "i").test(str);
-}
-
-function matchesModelPattern(
-	modelId: string,
-	provider: string,
-	pattern: string,
-): boolean {
-	const fullId = `${provider}/${modelId}`;
-	if (pattern.includes("/")) {
-		return matchGlob(fullId, pattern);
-	}
-	return matchGlob(modelId, pattern) || matchGlob(provider, pattern);
-}
-
-function getIdleTimeoutSeconds(model: Model<Api> | undefined): number {
-	const defaultFallback =
-		(looseSettings.get("compaction.idleTimeoutSeconds") as number) ?? 300;
-	if (!model) {
-		return defaultFallback;
-	}
-
-	const modelId = model.id;
-	const provider = model.provider || "";
-
-	// 1. Check custom overrides from settings
-	const customThresholds =
-		(looseSettings.get("relace.idleCompactionThresholds") as Record<
-			string,
-			number
-		>) || {};
-
-	for (const pattern of Object.keys(customThresholds)) {
-		if (matchesModelPattern(modelId, provider, pattern)) {
-			const seconds = customThresholds[pattern];
-			if (typeof seconds === "number" && seconds > 0) {
-				return seconds;
-			}
-		}
-	}
-
-	// 2. If running under pi-agent, check default family rules
-	const isPi = activeAgentDir.includes(".pi");
-	if (isPi) {
+		!isRecord(value) ||
+		!Array.isArray(value.messages) ||
+		value.messages.length === 0
+	)
+		throw new Error("Relace API returned no compacted messages.");
+	const messages: RelaceMessage[] = [];
+	for (const candidate of value.messages) {
+		if (!isRecord(candidate))
+			throw new Error("Relace API returned an invalid message.");
+		const role = candidate.role;
+		const content = candidate.content;
 		if (
-			matchesModelPattern(modelId, provider, "openai*/gpt*") ||
-			matchesModelPattern(modelId, provider, "openai-codex/gpt*") ||
-			modelId.toLowerCase().startsWith("gpt") ||
-			provider.toLowerCase() === "openai"
-		) {
-			return 1800; // 30 minutes
-		}
-		if (
-			matchesModelPattern(modelId, provider, "claude*/*") ||
-			matchesModelPattern(modelId, provider, "anthropic/*") ||
-			modelId.toLowerCase().includes("claude") ||
-			provider.toLowerCase() === "anthropic"
-		) {
-			return 300; // 5 minutes
-		}
+			(role !== "user" &&
+				role !== "assistant" &&
+				role !== "developer" &&
+				role !== "tool" &&
+				role !== "system") ||
+			(typeof content !== "string" && !Array.isArray(content))
+		)
+			throw new Error("Relace API returned an invalid message shape.");
+		const toolCallId = candidate.tool_call_id;
+		if (toolCallId !== undefined && typeof toolCallId !== "string")
+			throw new Error("Relace API returned an invalid tool_call_id.");
+		messages.push({
+			role,
+			content,
+			...(toolCallId ? { tool_call_id: toolCallId } : {}),
+		});
 	}
-
-	// 3. Fall back to OMP default
-	return defaultFallback;
+	return messages;
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-function estimateMessagesTokens(messages: AgentMessage[]): number {
-	let total = 0;
-	for (const msg of messages) {
-		total += estimateTokens(msg);
-	}
-	return total;
-}
-
-function convertToLlmFormat(messages: AgentMessage[]): RelaceMessage[] {
-	const result: RelaceMessage[] = [];
-	for (const msg of messages) {
-		const role = msg.role;
-		if (
-			role === "user" ||
-			role === "assistant" ||
-			(role as string) === "developer"
-		) {
-			if ("content" in msg) {
-				const content = msg.content;
-				if (typeof content === "string" || Array.isArray(content)) {
-					result.push({
-						role: role as "user" | "assistant" | "developer",
-						content,
-					});
-				}
+function contentText(content: string | unknown[]): string {
+	if (typeof content === "string") return content;
+	return content
+		.map((block) => {
+			if (isRecord(block)) {
+				if (typeof block.text === "string") return block.text;
+				if (typeof block.thinking === "string") return block.thinking;
 			}
-		} else if (role === "toolResult") {
-			if (
-				msg &&
-				typeof msg === "object" &&
-				"toolCallId" in msg &&
-				"content" in msg
-			) {
-				const content = msg.content;
-				if (typeof content === "string" || Array.isArray(content)) {
-					result.push({
-						role: "tool",
-						tool_call_id: String(msg.toolCallId),
-						content,
-					});
-				}
-			}
-		}
-	}
-	return result;
+			return JSON.stringify(block);
+		})
+		.filter((text) => text.length > 0)
+		.join("\n");
 }
 
-function isCompactionSummaryMessage(
-	msg: AgentMessage,
-): msg is CompactionSummaryMessage {
-	return msg.role === COMPACTION_SUMMARY_ROLE;
-}
-
-// ============================================================================
-// Relace Compact API
-// ============================================================================
-
-async function callRelaceCompact(
-	apiKey: string,
-	endpoint: string,
+function toAgentMessages(
 	messages: RelaceMessage[],
-	targetTokens: number,
-	modelId: string,
-	signal?: AbortSignal,
-): Promise<CompactResponse> {
-	const res = await fetch(endpoint, {
+	model: Model<Api> | undefined,
+): Message[] {
+	const converted: Message[] = [];
+	const baseTimestamp = Date.now();
+	for (const [index, message] of messages.entries()) {
+		const text = contentText(message.content);
+		const timestamp = baseTimestamp + index;
+		if (message.role === "assistant") {
+			converted.push({
+				role: "assistant",
+				content: [{ type: "text", text }],
+				api: model?.api ?? "openai-responses",
+				provider: model?.provider ?? "openai",
+				model: model?.id ?? "relace-compact",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp,
+			});
+		} else if (message.role === "user")
+			converted.push({ role: "user", content: text, timestamp });
+		else {
+			const suffix = message.tool_call_id ? ` (${message.tool_call_id})` : "";
+			converted.push({
+				role: "user",
+				content: `[${message.role}${suffix}]\n${text}`,
+				timestamp,
+			});
+		}
+	}
+	return converted;
+}
+
+function summaryFromRelace(messages: RelaceMessage[]): string {
+	return messages
+		.map((message) => `[${message.role}] ${contentText(message.content)}`)
+		.join("\n\n");
+}
+
+async function callRelace(
+	config: RelaceConfig,
+	messages: AgentMessage[],
+	model: Model<Api> | undefined,
+	signal: AbortSignal,
+): Promise<RelaceMessage[]> {
+	const response = await fetch(config.endpoint, {
 		method: "POST",
 		headers: {
-			Authorization: `Bearer ${apiKey}`,
+			Authorization: `Bearer ${config.apiKey}`,
 			"Content-Type": "application/json",
 		},
 		body: JSON.stringify({
-			messages,
-			target_tokens: targetTokens,
-			agent_model: modelId,
+			messages: toRelaceMessages(messages),
+			target_tokens: config.targetTokens,
+			agent_model: model?.id ?? "unknown",
 		}),
 		signal,
 	});
-
-	if (!res.ok) {
-		const text = await res.text();
+	if (!response.ok)
 		throw new Error(
-			`Relace API error: ${res.status} ${res.statusText} — ${text}`,
+			`Relace API error ${response.status}: ${await response.text()}`,
 		);
-	}
-
-	const data: unknown = await res.json();
-	if (
-		!data ||
-		typeof data !== "object" ||
-		!("messages" in data) ||
-		!Array.isArray(data.messages)
-	) {
-		throw new Error(
-			"Relace API returned an unexpected shape (missing messages array).",
-		);
-	}
-
-	return data as CompactResponse;
+	const body: unknown = await response.json();
+	return parseRelaceMessages(body);
 }
 
-// ============================================================================
-// Compaction Logic
-// ============================================================================
-
-async function performCompaction(
-	messages: AgentMessage[],
-	model: Model<Api> | undefined,
-	ctx: ExtensionContext,
-): Promise<SessionState> {
-	const sessionId = ctx.sessionManager.getSessionId();
-	const state = getSessionState(sessionId);
-	const apiKey = getApiKey();
-	if (!apiKey) {
-		throw new Error(
-			"Relace API key not configured. Set relace.apiKey in settings.",
-		);
-	}
-
-	const targetTokens = getTargetTokens(model);
-	const endpoint = getEndpoint();
-	const modelId = model?.id ?? "gpt-5.5";
-
-	const llmMessages = convertToLlmFormat(messages);
-	const response = await callRelaceCompact(
-		apiKey,
-		endpoint,
-		llmMessages,
-		targetTokens,
-		modelId,
-	);
-
-	state.compactedMessages = response.messages;
-	state.originalCountCompacted = messages.length;
-	state.compactionCount += 1;
-
-	return state;
-}
-
-/**
- * Compact if the context size meets OMP's configured idle or safety threshold.
- * OMP already provides these settings via the standard UI / settings.jsonl:
- *   - compaction.idleThresholdTokens
- *   - compaction.idleTimeoutSeconds (idle delay)
- *   - compaction.thresholdTokens / compaction.thresholdPercent (generic trigger)
- *
- * The plugin also requires the cache-miss (idle) gate to hold for "idle"-reason
- * compactions — compaction triggered by crossing a threshold mid-session keeps
- * the LLM running without interruption.
- */
-function shouldCompact(messages: AgentMessage[]): {
-	should: boolean;
-	reason: "idle" | "threshold" | "none";
-} {
-	const totalTokens = estimateMessagesTokens(messages);
-	const idleThreshold =
-		get<number>("compaction.idleThresholdTokens") ?? 200_000;
-	const tokenLimit = get<number>("compaction.tokenLimit") ?? 0;
-	const thresholdTokens = tokenLimit > 0 ? tokenLimit : idleThreshold;
-
-	if (totalTokens >= thresholdTokens) {
-		return { should: true, reason: "threshold" };
-	}
-	if (totalTokens >= idleThreshold) {
-		return { should: true, reason: "idle" };
-	}
-	return { should: false, reason: "none" };
-}
-
-function get<K = unknown>(key: string): K {
-	return looseSettings.get(key) as K;
-}
-
-// ============================================================================
-// Event Handlers
-// ============================================================================
-
-/**
- * Hook into OMP's native `session_before_compact` to reroute compaction to
- * Relace. This handles OpenAI Responses (via `preserveData.openaiRemoteCompaction`)
- * so native replay works, and also handles Claude via the `context` hook.
- */
-async function onSessionBeforeCompact(
-	event: SessionBeforeCompactEvent,
-	ctx: ExtensionContext,
-) {
-	updateActivePaths(ctx);
-	if (!isPluginEnabled()) {
-		return;
-	}
-	if (!isRelaceCompatibleStrategy()) {
-		return;
-	}
-	const apiKey = getApiKey();
-	if (!apiKey) {
-		return;
-	}
-
-	const messages = event.preparation.messagesToSummarize.concat(
-		event.preparation.turnPrefixMessages,
-	);
-	const targetTokens = getTargetTokens(ctx.model);
-	const endpoint = getEndpoint();
-	const modelId = ctx.model?.id ?? "gpt-5.5";
-
-	try {
-		const wireMessages = convertToLlmFormat(messages);
-		const response = await callRelaceCompact(
-			apiKey,
-			endpoint,
-			wireMessages,
-			targetTokens,
-			modelId,
-			event.signal,
-		);
-
-		const state = getSessionState(ctx.sessionManager.getSessionId());
-		state.compactedMessages = response.messages;
-		state.originalCountCompacted = messages.length;
-		state.compactionCount += 1;
-
-		return {
-			compaction: {
-				summary: `Compacted via Relace from ${event.preparation.tokensBefore} tokens.`,
-				firstKeptEntryId: event.preparation.firstKeptEntryId,
-				tokensBefore: event.preparation.tokensBefore,
-				preserveData: {
-					openaiRemoteCompaction: {
-						provider: ctx.model?.provider ?? "openai",
-						replacementHistory: response.messages,
-					},
-				},
-			},
-		};
-	} catch (err) {
-		console.error(
-			"[relace-compact] native compaction hook failed:",
-			err instanceof Error ? err.message : err,
-		);
-		return;
-	}
-}
-
-/**
- * Hook into the `context` event to replace OMP's `compactionSummary` message with
- * the actual Relace-compacted message array. This is required for providers
- * that do not support stateful history replay (e.g., Claude/Anthropic Messages).
- *
- * It also triggers its own compaction on cache-miss idle turns or when the
- * configured safety threshold is crossed — covering the case where OMP's own
- * compaction is disabled (`compaction.strategy = "off"`) but the plugin is still
- * expected to do the right thing.
- */
-async function onContext(
-	event: ContextEvent,
-	ctx: ExtensionContext,
-): Promise<{ messages: AgentMessage[] } | undefined> {
-	updateActivePaths(ctx);
-	if (!isPluginEnabled()) {
-		return undefined;
-	}
-	if (!isRelaceCompatibleStrategy()) {
-		return undefined;
-	}
-
-	const messages = event.messages;
-	const state = getSessionState(ctx.sessionManager.getSessionId());
-
-	// Case 1: sessionManager already wrote a compactionSummary entry via OMP's
-	// native flow. Swap it with our cached Relace messages (for non-OpenAI models).
-	const compactionIdx = messages.findIndex(isCompactionSummaryMessage);
-	if (compactionIdx !== -1 && state.compactedMessages) {
-		const newTurns = messages.slice(compactionIdx + 1);
-		const isOpenAi =
-			ctx.model?.api === "openai-responses" ||
-			ctx.model?.api === "openai-codex-responses" ||
-			ctx.model?.api === "openai-completions";
-		if (!isOpenAi) {
-			return { messages: [...state.compactedMessages, ...newTurns] };
-		}
-	}
-
-	// Case 2: we compacted in-memory but OMP has not yet written a compactionSummary
-	// entry. Append any new turns since compaction.
-	if (state.compactedMessages && state.originalCountCompacted > 0) {
-		if (state.originalCountCompacted <= messages.length) {
-			const newTurns = messages.slice(state.originalCountCompacted);
-			return { messages: [...state.compactedMessages, ...newTurns] };
-		}
-	}
-
-	// Case 3: no cache yet; decide whether to compact now based on thresholds.
-	const { should, reason } = shouldCompact(messages);
-	if (!should) {
-		return undefined;
-	}
-
-	// Honor the idle gate for "idle"-reason triggers — don't fire mid-session.
-	if (reason === "idle") {
-		const idleDelayMs = getIdleTimeoutSeconds(ctx.model) * 1000;
-		if (Date.now() - state.lastTurnEndTime <= idleDelayMs) {
-			return undefined;
-		}
-	}
-
-	try {
-		await performCompaction(messages, ctx.model, ctx);
-		return { messages };
-	} catch (err) {
-		console.error(
-			"[relace-compact] compaction failed:",
-			err instanceof Error ? err.message : err,
-		);
-		return undefined;
-	}
-}
-
-function onTurnEnd(ctx: ExtensionContext): void {
-	const sessionId = ctx.sessionManager.getSessionId();
-	const state = getSessionState(sessionId);
-	state.lastTurnEndTime = Date.now();
-}
-
-// ============================================================================
-// Commands
-// ============================================================================
-
-function outputCommandMessage(
+function commandOutput(
 	ctx: ExtensionCommandContext,
 	text: string,
-	level: "info" | "warning" | "error",
+	level: NoticeLevel,
 ): void {
-	ctx.ui.notify(text, level);
-	if (ctx.mode !== "tui") {
-		if (level === "error") {
-			console.error(text);
-		} else {
-			console.log(text);
+	if (ctx.hasUI) ctx.ui.notify(text, level);
+	else if (level === "error") console.error(text);
+	else console.log(text);
+}
+
+function eventError(ctx: ExtensionContext, message: string): void {
+	if (ctx.hasUI) ctx.ui.notify(message, "error");
+	else console.error(message);
+}
+
+function lastCompactionIndex(messages: AgentMessage[]): number {
+	for (let index = messages.length - 1; index >= 0; index--)
+		if (messages[index]?.role === "compactionSummary") return index;
+	return -1;
+}
+
+function clearTimer(state: SessionState): void {
+	if (state.idleTimer !== undefined) clearTimeout(state.idleTimer);
+	state.idleTimer = undefined;
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+	if (isRecord(timer) && typeof timer.unref === "function") timer.unref();
+}
+
+function invokeCompact(
+	ctx: ExtensionContext,
+	callbacks: CompactCallbacks,
+): void {
+	let settled = false;
+	const complete = () => {
+		if (!settled) {
+			settled = true;
+			callbacks.onComplete?.();
 		}
-	}
-}
-
-function handleStatusCommand(ctx: ExtensionCommandContext): void {
-	updateActivePaths(ctx);
-	const sessionId = ctx.sessionManager.getSessionId();
-	const state = getSessionState(sessionId);
-	const currentTokens = ctx.getContextUsage()?.tokens ?? 0;
-	const isEnabled = isPluginEnabled();
-	const strategy = getCompactionStrategy();
-	const strategyHonored = isRelaceCompatibleStrategy();
-	const idleTimeout = getIdleTimeoutSeconds(ctx.model);
-
-	const report = [
-		`Relace Compact Status — Session ${sessionId}:`,
-		`  Plugin enabled: ${isEnabled}`,
-		`  Strategy:       ${strategy}${strategyHonored ? " (honored)" : " (ignored — Relace only handles context-full and handoff)"}`,
-		`  Idle timeout:   ${idleTimeout} seconds (${(idleTimeout / 60).toFixed(1)} minutes)`,
-		`  Cached:         ${state.compactedMessages ? `Yes (${state.compactedMessages.length} messages, ${state.compactionCount} compactions)` : "No"}`,
-		`  Current tokens: ${currentTokens.toLocaleString()}`,
-		`  Target tokens:  ${getTargetTokens().toLocaleString()}`,
-		`  Endpoint:       ${getEndpoint()}`,
-	].join("\n");
-
-	outputCommandMessage(ctx, report, "info");
-}
-
-function handleResetCommand(ctx: ExtensionCommandContext): void {
-	const sessionId = ctx.sessionManager.getSessionId();
-	sessionStates.delete(sessionId);
-	outputCommandMessage(
-		ctx,
-		`Relace compact cache cleared for session ${sessionId}. Next turn will re-compact if thresholds are met.`,
-		"info",
-	);
-}
-
-/**
- * Force a compaction immediately. This clears the cache and triggers performCompaction
- * on the current session messages via ctx.compact(), which fires the session_before_compact
- * hook that routes through Relace.
- */
-async function handleCompactCommand(
-	ctx: ExtensionCommandContext,
-): Promise<void> {
-	updateActivePaths(ctx);
-	const sessionId = ctx.sessionManager.getSessionId();
-	const apiKey = getApiKey();
-
-	if (!isPluginEnabled()) {
-		outputCommandMessage(
-			ctx,
-			"Relace Compact is disabled. Enable it with relace.enabled.",
-			"warning",
-		);
-		return;
-	}
-	if (!isRelaceCompatibleStrategy()) {
-		outputCommandMessage(
-			ctx,
-			`Current compaction strategy "${getCompactionStrategy()}" is not compatible with Relace. Set compaction.strategy to "context-full" or "handoff".`,
-			"warning",
-		);
-		return;
-	}
-	if (!apiKey) {
-		outputCommandMessage(
-			ctx,
-			"Relace API key not configured. Set relace.apiKey in settings or RELACE_API_KEY env var.",
-			"warning",
-		);
-		return;
-	}
-
-	// Clear cache so the next context event doesn't skip
-	sessionStates.delete(sessionId);
-
-	outputCommandMessage(
-		ctx,
-		"Forcing Relace compaction via native /compact...",
-		"info",
-	);
+	};
+	const fail = (error: unknown) => {
+		if (!settled) {
+			settled = true;
+			callbacks.onError?.(toError(error));
+		}
+	};
 	try {
-		ctx.compact({
-			customInstructions: "Compact via Relace Compact",
+		const compact = ctx.compact as unknown as (
+			options: CompactCallbacks,
+		) => unknown;
+		const result = compact({
+			onComplete: complete,
+			onError: (error) => fail(error),
 		});
-		outputCommandMessage(
-			ctx,
-			"Relace compaction triggered successfully.",
-			"info",
-		);
-	} catch (err) {
-		outputCommandMessage(
-			ctx,
-			`Forced compaction failed: ${err instanceof Error ? err.message : String(err)}`,
-			"error",
-		);
-	}
-}
-
-// ============================================================================
-// Extension Registration
-// ============================================================================
-
-function updateActivePaths(ctx: ExtensionContext) {
-	activeCwd = ctx.cwd;
-	try {
-		const sessionFile = ctx.sessionManager.getSessionFile();
-		if (sessionFile) {
-			activeAgentDir = path.resolve(sessionFile, "../..");
-		}
-	} catch (_e) {
-		// ignore
+		if (isPromiseLike(result))
+			void Promise.resolve(result).then(complete, fail);
+	} catch (error) {
+		fail(error);
 	}
 }
 
 export default function relaceCompactExtension(pi: ExtensionAPI): void {
-	const untypedPi = pi as unknown as Record<string, unknown>;
-	if (untypedPi.pi) {
-		const piSdk = untypedPi.pi as Record<string, unknown>;
-		const SettingsClass = piSdk.Settings as Record<string, unknown>;
-		if (SettingsClass?.instance) {
-			try {
-				const settingsInstance = SettingsClass.instance as Record<
-					string,
-					unknown
-				>;
-				if (typeof settingsInstance.getAgentDir === "function") {
-					activeAgentDir = (settingsInstance.getAgentDir as () => string)();
-				}
-				if (typeof settingsInstance.getCwd === "function") {
-					activeCwd = (settingsInstance.getCwd as () => string)();
-				}
-			} catch (_e) {
-				// ignore
-			}
-		}
-	}
+	const ompSettings = findOmpSettings(pi);
+	const settings = new SettingsStore(ompSettings ? "omp" : "pi", ompSettings);
+	const sessions = new Map<string, SessionState>();
 
-	if (typeof untypedPi.setLabel === "function") {
+	const sessionState = (ctx: ExtensionContext): SessionState => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		let state = sessions.get(sessionId);
+		if (!state) {
+			state = {
+				replacement: undefined,
+				compactions: 0,
+				idleTimer: undefined,
+				compactPending: false,
+			};
+			sessions.set(sessionId, state);
+		}
+		return state;
+	};
+
+	const requestCompact = (ctx: ExtensionContext, announce: boolean): void => {
+		const state = sessionState(ctx);
+		if (state.compactPending) return;
+		state.compactPending = true;
+		clearTimer(state);
+		invokeCompact(ctx, {
+			onComplete: () => {
+				state.compactPending = false;
+				if (announce && ctx.hasUI)
+					ctx.ui.notify("Relace compaction complete.", "info");
+			},
+			onError: (error) => {
+				state.compactPending = false;
+				const benign =
+					error.message.includes("Already compacted") ||
+					error.message.includes("Nothing to compact");
+				if (announce || !benign)
+					eventError(ctx, `Relace compaction failed: ${error.message}`);
+			},
+		});
+	};
+
+	const onBeforeCompact = async (
+		event: SessionBeforeCompactEvent,
+		ctx: ExtensionContext,
+	) => {
+		const state = sessionState(ctx);
+		clearTimer(state);
+		const config = await settings.getConfig(ctx);
+		if (!config.enabled || !supportsRoute(settings)) return;
+		if (!config.apiKey) {
+			eventError(ctx, "Relace API key is not configured.");
+			return { cancel: true };
+		}
+		const sourceMessages = event.preparation.messagesToSummarize.concat(
+			event.preparation.turnPrefixMessages,
+		);
 		try {
-			if (untypedPi.setLabel.length === 1) {
-				(untypedPi.setLabel as (label: string) => void)("Relace Compact");
-			}
-		} catch (_e) {
-			// ignore
+			const relaceMessages = await callRelace(
+				config,
+				sourceMessages,
+				ctx.model,
+				event.signal,
+			);
+			state.replacement = toAgentMessages(relaceMessages, ctx.model);
+			state.compactions += 1;
+			return {
+				compaction: {
+					summary: summaryFromRelace(relaceMessages),
+					firstKeptEntryId: event.preparation.firstKeptEntryId,
+					tokensBefore: event.preparation.tokensBefore,
+					details: { relaceMessages },
+				},
+			};
+		} catch (error) {
+			eventError(ctx, `Relace compaction failed: ${toError(error).message}`);
+			return { cancel: true };
 		}
-	}
+	};
 
-	// Core event: intercept outbound LLM context to inject compacted messages.
-	pi.on("context", onContext);
+	const recoverReplacement = (ctx: ExtensionContext): Message[] | undefined => {
+		const entries = ctx.sessionManager.getBranch();
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i];
+			if (entry.type !== "compaction") continue;
+			const details = entry.details as unknown as
+				| { relaceMessages?: RelaceMessage[] }
+				| undefined;
+			if (!isRecord(details) || !Array.isArray(details.relaceMessages))
+				continue;
+			return toAgentMessages(details.relaceMessages, ctx.model);
+		}
+		return undefined;
+	};
 
-	// Track turn boundaries for cache miss detection.
-	pi.on("turn_end", (_, ctx: ExtensionContext) => onTurnEnd(ctx));
+	const onContext = async (
+		event: ContextEvent,
+		ctx: ExtensionContext,
+	): Promise<{ messages: AgentMessage[] } | undefined> => {
+		if (!(await settings.getConfig(ctx)).enabled) return undefined;
+		const state = sessionState(ctx);
+		if (state.replacement === undefined) {
+			state.replacement = recoverReplacement(ctx);
+		}
+		if (!state.replacement) return undefined;
+		const index = lastCompactionIndex(event.messages);
+		if (index < 0) return undefined;
+		return {
+			messages: [...state.replacement, ...event.messages.slice(index + 1)],
+		};
+	};
 
-	// Hook for OMP native compaction to reroute via Relace.
-	pi.on("session_before_compact", onSessionBeforeCompact);
-
-	// Slash commands for introspection and forced compaction.
-	pi.registerCommand("compact-relace", {
-		description: "Inspect or manage Relace Compact state",
-		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			try {
-				const sub = args.trim();
-				if (sub === "status") handleStatusCommand(ctx);
-				else if (sub === "reset") handleResetCommand(ctx);
-				else if (sub === "compact") await handleCompactCommand(ctx);
-				else {
-					ctx.ui.notify(
-						"Usage: /compact-relace status | /compact-relace reset | /compact-relace compact",
-						"info",
-					);
-				}
-			} catch (err) {
-				console.error("[relace-compact] Command execution error:", err);
-				if (err instanceof Error) {
-					console.error(err.stack);
-				}
-				throw err;
+	const onAgentEnd = async (
+		_event: unknown,
+		ctx: ExtensionContext,
+	): Promise<void> => {
+		const config = await settings.getConfig(ctx);
+		const state = sessionState(ctx);
+		clearTimer(state);
+		if (
+			!config.enabled ||
+			!config.apiKey ||
+			!supportsRoute(settings) ||
+			state.compactPending
+		)
+			return;
+		if (settings.host === "pi") {
+			const usage = ctx.getContextUsage();
+			const threshold = piThresholdTokens(config, ctx.model);
+			if (
+				usage?.tokens !== null &&
+				usage?.tokens !== undefined &&
+				threshold !== undefined &&
+				usage.tokens >= threshold
+			) {
+				requestCompact(ctx, false);
+				return;
 			}
+		}
+		const idleSeconds = idleTimeoutForModel(config, ctx.model);
+		if (idleSeconds === 0) return;
+		const sessionId = ctx.sessionManager.getSessionId();
+		state.idleTimer = setTimeout(() => {
+			if (
+				ctx.sessionManager.getSessionId() === sessionId &&
+				ctx.isIdle() &&
+				!ctx.hasPendingMessages() &&
+				!state.compactPending
+			)
+				requestCompact(ctx, false);
+		}, idleSeconds * 1000);
+		unrefTimer(state.idleTimer);
+	};
+
+	const status = async (ctx: ExtensionCommandContext): Promise<void> => {
+		const config = await settings.getConfig(ctx);
+		const state = sessionState(ctx);
+		const usage = ctx.getContextUsage();
+		const idleSeconds = idleTimeoutForModel(config, ctx.model);
+		const strategy = settings.getOmpStrategy();
+		const route =
+			settings.host === "pi"
+				? "all pi compactions → Relace"
+				: strategy === "context-full"
+					? "OMP full-context → Relace"
+					: strategy === "handoff"
+						? "OMP handoff compact hook → Relace"
+						: "OMP native (Relace routing inactive)";
+		const lines = [
+			"Relace Compact",
+			`Host: ${settings.host === "omp" ? "OMP" : "pi-agent"}`,
+			`Enabled: ${config.enabled ? "yes" : "no"}`,
+			`API key: ${config.apiKey ? "configured" : "missing"}`,
+			`Route: ${route}`,
+			`Idle: ${idleSeconds}s`,
+			`Target: ${config.targetTokens.toLocaleString()} tokens`,
+			`Context: ${usage?.tokens?.toLocaleString() ?? "unknown"} / ${usage?.contextWindow.toLocaleString() ?? "unknown"}`,
+			`Session compactions: ${state.compactions}`,
+		];
+		if (settings.host === "pi") {
+			const threshold = piThresholdTokens(config, ctx.model);
+			const trigger =
+				config.piThresholdType === "percentage"
+					? `${config.piThreshold}%${threshold ? ` (${threshold.toLocaleString()} tokens)` : ""}`
+					: `${Math.round(config.piThreshold).toLocaleString()} tokens`;
+			lines.splice(6, 0, `Pi trigger: ${trigger}`);
+		}
+		commandOutput(ctx, lines.join("\n"), "info");
+	};
+
+	const compact = async (ctx: ExtensionCommandContext): Promise<void> => {
+		const config = await settings.getConfig(ctx);
+		if (!config.enabled) {
+			commandOutput(
+				ctx,
+				"Relace Compact is disabled. Run /compact-relace enable.",
+				"warning",
+			);
+			return;
+		}
+		if (!supportsRoute(settings)) {
+			commandOutput(
+				ctx,
+				"Relace routing is inactive for the current OMP compaction strategy.",
+				"warning",
+			);
+			return;
+		}
+		if (!config.apiKey) {
+			commandOutput(ctx, "Relace API key is not configured.", "warning");
+			return;
+		}
+		commandOutput(ctx, "Starting Relace compaction…", "info");
+		requestCompact(ctx, true);
+	};
+
+	pi.on("session_before_compact", onBeforeCompact);
+	pi.on("context", onContext);
+	pi.on("agent_end", onAgentEnd);
+	pi.on("session_shutdown", (_event, ctx) => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const state = sessions.get(sessionId);
+		if (state) clearTimer(state);
+		sessions.delete(sessionId);
+	});
+
+	pi.registerCommand("compact-relace", {
+		description: "Compact with Relace or inspect its state",
+		handler: async (args: string, ctx: ExtensionCommandContext) => {
+			const command = args.trim();
+			if (command === "status") await status(ctx);
+			else if (command === "disable") {
+				await settings.setEnabled(ctx.cwd, false);
+				for (const state of sessions.values()) clearTimer(state);
+				commandOutput(ctx, "Relace Compact disabled.", "info");
+			} else if (command === "enable") {
+				await settings.setEnabled(ctx.cwd, true);
+				commandOutput(ctx, "Relace Compact enabled.", "info");
+			} else if (command === "reset") {
+				const state = sessionState(ctx);
+				state.replacement = undefined;
+				state.compactions = 0;
+				commandOutput(ctx, "Relace session state cleared.", "info");
+			} else if (command === "" || command === "compact") await compact(ctx);
+			else
+				commandOutput(
+					ctx,
+					"Usage: /compact-relace [compact|status|disable|enable|reset]",
+					"info",
+				);
 		},
 	});
 }
