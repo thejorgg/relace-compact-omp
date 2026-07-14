@@ -14,7 +14,7 @@ const PACKAGE_NAME = "relace-compact-omp";
 const RELACE_ENDPOINT = "https://compact.endpoint.relace.run/v1/code/compact";
 const OMP_PLUGINS_MODULE = "@oh-my-pi/pi-coding-agent/extensibility/plugins";
 const DEFAULT_IDLE_SECONDS = 300;
-const DEFAULT_TARGET_TOKENS = 128_000;
+const DEFAULT_TARGET_PERCENT = 50;
 const DEFAULT_PI_THRESHOLD = 80;
 
 type HostKind = "omp" | "pi";
@@ -45,7 +45,7 @@ interface RelaceConfig {
 	enabled: boolean;
 	apiKey: string;
 	endpoint: string;
-	targetTokens: number;
+	targetPercent: number;
 	idleTimeoutSeconds: number;
 	idleModelOverrides: ReadonlyArray<readonly [string, number]>;
 	piThresholdType: PiThresholdType;
@@ -228,10 +228,14 @@ function buildConfig(
 			enabledOverride ?? getPathValue(values, "relace.enabled") !== false,
 		apiKey,
 		endpoint: endpointSetting(getPathValue(values, "relace.endpoint")),
-		targetTokens: Math.round(
-			positiveNumber(
-				getPathValue(values, "relace.targetTokens"),
-				DEFAULT_TARGET_TOKENS,
+		targetPercent: Math.min(
+			100,
+			Math.max(
+				1,
+				positiveNumber(
+					getPathValue(values, "relace.targetPercent"),
+					DEFAULT_TARGET_PERCENT,
+				),
 			),
 		),
 		idleTimeoutSeconds: nonNegativeNumber(
@@ -487,6 +491,15 @@ function summaryFromRelace(messages: RelaceMessage[]): string {
 		.join("\n\n");
 }
 
+function targetTokensForModel(
+	config: RelaceConfig,
+	model: Model<Api> | undefined,
+): number {
+	const contextWindow = model?.contextWindow ?? 0;
+	if (contextWindow <= 0) return Math.round(config.targetPercent * 1000);
+	return Math.max(1, Math.round((contextWindow * config.targetPercent) / 100));
+}
+
 async function callRelace(
 	config: RelaceConfig,
 	messages: AgentMessage[],
@@ -501,7 +514,7 @@ async function callRelace(
 		},
 		body: JSON.stringify({
 			messages: toRelaceMessages(messages),
-			target_tokens: config.targetTokens,
+			target_tokens: targetTokensForModel(config, model),
 			agent_model: model?.id ?? "unknown",
 		}),
 		signal,
@@ -751,7 +764,7 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 			`API key: ${config.apiKey ? "configured" : "missing"}`,
 			`Route: ${route}`,
 			`Idle: ${idleSeconds}s`,
-			`Target: ${config.targetTokens.toLocaleString()} tokens`,
+			`Target: ${config.targetPercent}% (${targetTokensForModel(config, ctx.model).toLocaleString()} tokens)`,
 			`Context: ${usage?.tokens?.toLocaleString() ?? "unknown"} / ${usage?.contextWindow.toLocaleString() ?? "unknown"}`,
 			`Session compactions: ${state.compactions}`,
 		];
@@ -762,6 +775,11 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 					? `${config.piThreshold}%${threshold ? ` (${threshold.toLocaleString()} tokens)` : ""}`
 					: `${Math.round(config.piThreshold).toLocaleString()} tokens`;
 			lines.splice(6, 0, `Pi trigger: ${trigger}`);
+		}
+		if (settings.host === "omp" && strategy === undefined) {
+			lines.push(
+				"Notice: change Compaction Strategy to context-full to use Relace.",
+			);
 		}
 		commandOutput(ctx, lines.join("\n"), "info");
 	};
@@ -819,7 +837,7 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 				state.replacement = undefined;
 				state.compactions = 0;
 				commandOutput(ctx, "Relace session state cleared.", "info");
-			} else if (command === "" || command === "compact") await compact(ctx);
+			} else if (command === "compact") await compact(ctx);
 			else
 				commandOutput(
 					ctx,

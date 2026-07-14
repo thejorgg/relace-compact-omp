@@ -55,11 +55,12 @@
 				"default": "https://compact.endpoint.relace.run/v1/code/compact",
 				"description": "Relace Compact API endpoint."
 			},
-			"relace.targetTokens": {
+			"relace.targetPercent": {
 				"type": "number",
-				"default": 128000,
+				"default": 50,
 				"min": 1,
-				"description": "Requested post-compaction token target."
+				"max": 100,
+				"description": "Target percentage of the active model context after compaction."
 			},
 			"relace.idleTimeoutSeconds": {
 				"type": "number",
@@ -96,11 +97,12 @@
 				"default": "https://compact.endpoint.relace.run/v1/code/compact",
 				"description": "Relace Compact API endpoint."
 			},
-			"relace.targetTokens": {
+			"relace.targetPercent": {
 				"type": "number",
-				"default": 128000,
+				"default": 50,
 				"min": 1,
-				"description": "Requested post-compaction token target."
+				"max": 100,
+				"description": "Target percentage of the active model context after compaction."
 			},
 			"relace.idleTimeoutSeconds": {
 				"type": "number",
@@ -131,6 +133,8 @@
 		}
 	},
 	"files": [
-		"src"
+		"src",
+		"README.md",
+		"LICENSE"
 	]
 }
