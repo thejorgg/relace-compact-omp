@@ -25,6 +25,8 @@
  *   - /relace reset         — clear cache and force re-compaction next turn.
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	type CompactionSummaryMessage,
@@ -64,11 +66,144 @@ interface SessionState {
 	compactionCount: number;
 }
 
-// Cast settings to a custom type for unchecked dynamic access (per project guidelines for dynamic plugin configurations)
+// ============================================================================
+// Custom Settings Loader (Workaround for OMP dynamic registration & duplicate package bugs)
+// ============================================================================
+
 interface LooseSettings {
 	get(key: string): unknown;
 }
-let looseSettings: LooseSettings;
+
+let activeAgentDir = "";
+let activeCwd = "";
+let yamlConfig: Record<string, any> = {};
+let lastLoadedTime = 0;
+
+function getAgentDirFallback(): string {
+	if (process.env.PI_CODING_AGENT_DIR) {
+		return process.env.PI_CODING_AGENT_DIR;
+	}
+	const home = process.env.HOME || process.env.USERPROFILE || "";
+	return path.join(home, ".omp", "agent");
+}
+
+function loadYamlSettings(agentDir: string, cwd: string): Record<string, any> {
+	const config: Record<string, any> = {};
+
+	// 1. Read global config
+	const globalConfigPath = path.join(agentDir, "config.yml");
+	if (fs.existsSync(globalConfigPath)) {
+		try {
+			const content = fs.readFileSync(globalConfigPath, "utf8");
+			const parsed = Bun.YAML.parse(content);
+			if (parsed && typeof parsed === "object") {
+				Object.assign(config, parsed);
+			}
+		} catch (e) {
+			// ignore
+		}
+	}
+
+	// 2. Read project config (check cwd/.omp/config.yml or cwd/config.yml or cwd/.claude/config.yml)
+	const projectPaths = [
+		path.join(cwd, ".omp", "config.yml"),
+		path.join(cwd, "config.yml"),
+		path.join(cwd, ".claude", "config.yml"),
+	];
+	for (const p of projectPaths) {
+		if (fs.existsSync(p)) {
+			try {
+				const content = fs.readFileSync(p, "utf8");
+				const parsed = Bun.YAML.parse(content);
+				if (parsed && typeof parsed === "object") {
+					Object.assign(config, parsed);
+				}
+				break; // Only load the first matching project config
+			} catch (e) {
+				// ignore
+			}
+		}
+	}
+
+	return config;
+}
+
+function getFromConfig(config: Record<string, any>, key: string): any {
+	if (key in config) {
+		return config[key];
+	}
+	const parts = key.split(".");
+	let val: any = config;
+	for (const part of parts) {
+		if (val && typeof val === "object" && part in val) {
+			val = val[part];
+		} else {
+			return undefined;
+		}
+	}
+	return val;
+}
+
+function ensureConfigLoaded() {
+	const agentDir = activeAgentDir || getAgentDirFallback();
+	const cwd = activeCwd || process.cwd();
+
+	// Throttle config file reads to at most once every 5 seconds
+	if (Date.now() - lastLoadedTime < 5000) {
+		return;
+	}
+	yamlConfig = loadYamlSettings(agentDir, cwd);
+	lastLoadedTime = Date.now();
+}
+
+const looseSettings: LooseSettings = {
+	get(key: string): unknown {
+		// 1. Environment variables override
+		if (key === "relace.apiKey") {
+			if (process.env.RELACE_API_KEY) return process.env.RELACE_API_KEY;
+			if (process.env.RELACE_API_TOKEN) return process.env.RELACE_API_TOKEN;
+		}
+
+		// 2. Read config from files
+		ensureConfigLoaded();
+		const val = getFromConfig(yamlConfig, key);
+		if (val !== undefined) {
+			return val;
+		}
+
+		// 3. Fallback to OMP-initialized settings instance (if it doesn't throw)
+		try {
+			const hostVal = settings.get(key as any);
+			if (hostVal !== undefined) {
+				return hostVal;
+			}
+		} catch (e) {
+			// ignore
+		}
+
+		// 4. Default fallbacks
+		switch (key) {
+			case "relace.enabled":
+				return true;
+			case "relace.apiKey":
+				return "";
+			case "relace.endpoint":
+				return RELACE_ENDPOINT_DEFAULT;
+			case "relace.targetTokens":
+				return 128000;
+			case "relace.thresholdtype":
+				return "integer";
+			case "compaction.idleTimeoutSeconds":
+				return 300;
+			case "compaction.idleThresholdTokens":
+				return 200000;
+			case "compaction.tokenLimit":
+				return 0;
+			default:
+				return undefined;
+		}
+	},
+};
 
 // ============================================================================
 // Constants
@@ -108,12 +243,6 @@ function isPluginEnabled(): boolean {
 }
 
 function getApiKey(): string {
-	if (process.env.RELACE_API_KEY) {
-		return process.env.RELACE_API_KEY;
-	}
-	if (process.env.RELACE_API_TOKEN) {
-		return process.env.RELACE_API_TOKEN;
-	}
 	const val = looseSettings.get("relace.apiKey");
 	return typeof val === "string" ? val : "";
 }
@@ -475,8 +604,14 @@ function handleResetCommand(ctx: ExtensionCommandContext): void {
 // ============================================================================
 
 export default function relaceCompactExtension(pi: ExtensionAPI): void {
-	looseSettings = (pi.pi?.Settings?.instance ||
-		settings) as unknown as LooseSettings;
+	if (pi.pi?.Settings?.instance) {
+		try {
+			activeAgentDir = pi.pi.Settings.instance.getAgentDir();
+			activeCwd = pi.pi.Settings.instance.getCwd();
+		} catch (e) {
+			// ignore
+		}
+	}
 	pi.setLabel("Relace Compact");
 
 	// Core event: intercept outbound LLM context to inject compacted messages.
@@ -492,11 +627,19 @@ export default function relaceCompactExtension(pi: ExtensionAPI): void {
 	pi.registerCommand("relace", {
 		description: "Inspect or manage Relace Compact state",
 		handler: async (args: string, ctx: ExtensionCommandContext) => {
-			const sub = args.trim();
-			if (sub === "status") handleStatusCommand(ctx);
-			else if (sub === "reset") handleResetCommand(ctx);
-			else {
-				console.log("Usage: /relace status | /relace reset");
+			try {
+				const sub = args.trim();
+				if (sub === "status") handleStatusCommand(ctx);
+				else if (sub === "reset") handleResetCommand(ctx);
+				else {
+					console.log("Usage: /relace status | /relace reset");
+				}
+			} catch (err) {
+				console.error("[relace-compact] Command execution error:", err);
+				if (err instanceof Error) {
+					console.error(err.stack);
+				}
+				throw err;
 			}
 		},
 	});
