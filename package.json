@@ -82,6 +82,7 @@
 		}
 	},
 	"pi": {
+		"video": "https://raw.githubusercontent.com/thejorgg/relace-compact-pi/main/assets/demo.mp4",
 		"extensions": [
 			"./src/extension.ts"
 		],
